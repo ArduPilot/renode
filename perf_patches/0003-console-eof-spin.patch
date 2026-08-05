@@ -1,0 +1,25 @@
+--- a/src/UI/ConsoleIOSource.cs
++++ b/src/UI/ConsoleIOSource.cs
+@@ -87,10 +87,20 @@
+ 
+         private void RedirectedHandling()
+         {
+-            // For cases in which input has been redirected from a file
++            // For cases in which input has been redirected from a file.
++            // At end of input Console.Read() returns -1 immediately and
++            // forever; the old unconditional loop then spun a whole core
++            // invoking ByteRead(-1) for the rest of the process. Forward
++            // the -1 once - AntShell's quit-on-EOF behaviour depends on
++            // seeing it - and stop.
+             while(true)
+             {
+-                ByteRead?.Invoke(Console.Read());
++                var value = Console.Read();
++                ByteRead?.Invoke(value);
++                if(value == -1)
++                {
++                    return;
++                }
+             }
+         }
+ 

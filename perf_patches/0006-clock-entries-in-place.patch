@@ -1,0 +1,43 @@
+diff --git a/src/Emulator/Main/Time/BaseClockSource.cs b/src/Emulator/Main/Time/BaseClockSource.cs
+index 1f7cd3cbe..aff604b78 100644
+--- a/src/Emulator/Main/Time/BaseClockSource.cs
++++ b/src/Emulator/Main/Time/BaseClockSource.cs
+@@ -581,6 +581,30 @@ private void Update(TimeInterval time, ref List<Action> alreadyRunHandlers)
+                 updateAlreadyInProgress = true;
+                 {
+                     nearestLimitIn = TimeInterval.Maximal;
++#if NET
++                    // ClockEntry is a large struct; the list indexer
++                    // copies it in and out on every enabled entry of
++                    // every update. A span over the backing array lets
++                    // the handler mutate in place. Safe here: the loop
++                    // body is pure arithmetic (handlers fire AFTER the
++                    // loop, from toNotify), so the list cannot change
++                    // shape while the span is live.
++                    var entriesSpan = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(clockEntries);
++                    for(var i = 0; i < entriesSpan.Length; i++)
++                    {
++                        ref var clockEntry = ref entriesSpan[i];
++                        if(!clockEntry.Enabled)
++                        {
++                            continue;
++                        }
++                        var updateHandler = clockEntriesUpdateHandlers[i];
++                        if(updateHandler(ref clockEntry, time + unaccountedTimes[i], ref nearestLimitIn) && !alreadyRunHandlers.Contains(clockEntry.Handler))
++                        {
++                            toNotify.Add(clockEntry.Handler);
++                        }
++                        unaccountedTimes[i] = TimeInterval.Empty;
++                    }
++#else
+                     for(var i = 0; i < clockEntries.Count; i++)
+                     {
+                         var clockEntry = clockEntries[i];
+@@ -596,6 +620,7 @@ private void Update(TimeInterval time, ref List<Action> alreadyRunHandlers)
+                         clockEntries[i] = clockEntry;
+                         unaccountedTimes[i] = TimeInterval.Empty;
+                     }
++#endif
+                 }
+                 try
+                 {

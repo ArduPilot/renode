@@ -1,0 +1,516 @@
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBus.cs b/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
+index 541f71ef9..3cfe83482 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
+@@ -551,6 +551,7 @@ public void RemoveTag(ulong address)
+                 tags.Remove(tag.Key);
+                 pausingTags.Remove(tag.Value.Name);
+             }
++            overridingTagsCount = -1;
+         }
+ 
+         public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false, bool overridePeripheralAccesses = false)
+@@ -559,6 +560,7 @@ public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing =
+             if(intersectings.Length == 0)
+             {
+                 tags.Add(range, new TagEntry { Name = tag, DefaultValue = defaultValue, Silent = silent, OverridePeripheralAccesses = overridePeripheralAccesses });
++                overridingTagsCount = -1;
+ 
+                 var onMappedMemory  = GetRegisteredPeripherals()
+                     .Where(x => x.Peripheral is MappedMemory)
+@@ -2308,16 +2310,48 @@ private bool RemoveMappingsForPeripheral(IBusPeripheral peripheral)
+             return true;
+         }
+ 
++        // Nearly no tag overrides peripheral accesses, yet the
++        // generated access path consulted the tag list on every bus
++        // access just in case one did. The count is recomputed lazily
++        // (-1 forces it) whenever the tag set changes, and the access
++        // path skips the lookup outright when it is zero; the
++        // non-existing-access report path still looks tags up on its
++        // own, cold, for their default values.
++        internal bool MayHaveOverridingTag()
++        {
++            var c = overridingTagsCount;
++            if(c < 0)
++            {
++                c = 0;
++                foreach(var t in tags)
++                {
++                    if(t.Value.OverridePeripheralAccesses)
++                    {
++                        c++;
++                    }
++                }
++                overridingTagsCount = c;
++            }
++            return c != 0;
++        }
++
++        [Transient]
++        private int overridingTagsCount = -1;
++
+         private bool TryGetTag(ulong address, out TagEntry? foundTag)
+         {
+-            // The `return` inside is intentional; we just want to find the first tag.
+-            // `FirstOrDefault` isn't used cause the default `Range` is a valid `<0, 0>` range.
+-            // `Any` + `First` aren't used to avoid analyzing `tags` keys up to the matching one twice.
+-            // `ToArray` isn't used to avoid analyzing all `tags` keys since we only use the first one.
+-            foreach(var tag in tags.Where(x => x.Key.Contains(address)).Select(x => x.Value))
++            // On the hot path of every bus access: a plain loop, because
++            // the previous Where/Select chain allocated a closure and two
++            // iterators per call - per MMIO access - which fed the GC
++            // measurably on MMIO-heavy workloads. Dictionary's struct
++            // enumerator allocates nothing.
++            foreach(var tag in tags)
+             {
+-                foundTag = tag;
+-                return true;
++                if(tag.Key.Contains(address))
++                {
++                    foundTag = tag.Value;
++                    return true;
++                }
+             }
+             foundTag = null;
+             return false;
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
+index 731e95613..56ce18b57 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
+@@ -43,7 +43,11 @@ public byte ReadByte(ulong address, IPeripheral context = null, ulong? cpuState
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenRead;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -55,6 +59,10 @@ public byte ReadByte(ulong address, IPeripheral context = null, ulong? cpuState
+ 
+                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, out var offset, cpuState))
+                 {
++                    if(tag == null)
++                    {
++                        TryGetTag(address, out tag);
++                    }
+                     return (byte)ReportNonExistingRead(address, tag, accessWidth);
+                 }
+                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
+@@ -119,7 +127,11 @@ public void WriteByte(ulong address, byte value, IPeripheral context = null, ulo
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenWrite;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -201,7 +213,11 @@ public ushort ReadWord(ulong address, IPeripheral context = null, ulong? cpuStat
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenRead;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -213,6 +229,10 @@ public ushort ReadWord(ulong address, IPeripheral context = null, ulong? cpuStat
+ 
+                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, out var offset, cpuState))
+                 {
++                    if(tag == null)
++                    {
++                        TryGetTag(address, out tag);
++                    }
+                     return (ushort)ReportNonExistingRead(address, tag, accessWidth);
+                 }
+                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
+@@ -277,7 +297,11 @@ public void WriteWord(ulong address, ushort value, IPeripheral context = null, u
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenWrite;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -359,7 +383,11 @@ public uint ReadDoubleWord(ulong address, IPeripheral context = null, ulong? cpu
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenRead;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -371,6 +399,10 @@ public uint ReadDoubleWord(ulong address, IPeripheral context = null, ulong? cpu
+ 
+                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, out var offset, cpuState))
+                 {
++                    if(tag == null)
++                    {
++                        TryGetTag(address, out tag);
++                    }
+                     return (uint)ReportNonExistingRead(address, tag, accessWidth);
+                 }
+                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
+@@ -435,7 +467,11 @@ public void WriteDoubleWord(ulong address, uint value, IPeripheral context = nul
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenWrite;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -517,7 +553,11 @@ public ulong ReadQuadWord(ulong address, IPeripheral context = null, ulong? cpuS
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenRead;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -529,6 +569,10 @@ public ulong ReadQuadWord(ulong address, IPeripheral context = null, ulong? cpuS
+ 
+                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, out var offset, cpuState))
+                 {
++                    if(tag == null)
++                    {
++                        TryGetTag(address, out tag);
++                    }
+                     return (ulong)ReportNonExistingRead(address, tag, accessWidth);
+                 }
+                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
+@@ -593,7 +637,11 @@ public void WriteQuadWord(ulong address, ulong value, IPeripheral context = null
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenWrite;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
+index fd1f76c0d..4fb04d4f9 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
+@@ -67,7 +67,11 @@ namespace Antmicro.Renode.Peripherals.Bus
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenRead;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+@@ -79,6 +83,10 @@ namespace Antmicro.Renode.Peripherals.Bus
+ 
+                 if(!TryFindPeripheralAccessMethods(address, context, out var accessMethods, out var startAddress, out var offset, cpuState))
+                 {
++                    if(tag == null)
++                    {
++                        TryGetTag(address, out tag);
++                    }
+                     return (<#= type #>)ReportNonExistingRead(address, tag, accessWidth);
+                 }
+                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
+@@ -143,7 +151,11 @@ namespace Antmicro.Renode.Peripherals.Bus
+ 
+             using(SetLocalContext(context, cpuState))
+             {
+-                TryGetTag(address, out var tag);
++                TagEntry? tag = null;
++                if(MayHaveOverridingTag())
++                {
++                    TryGetTag(address, out tag);
++                }
+                 var warning = TagOverriddenWrite;
+                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
+                 {
+diff --git a/src/Emulator/Main/Time/BaseClockSource.cs b/src/Emulator/Main/Time/BaseClockSource.cs
+index a4298a58f..b1d364cbb 100644
+--- a/src/Emulator/Main/Time/BaseClockSource.cs
++++ b/src/Emulator/Main/Time/BaseClockSource.cs
+@@ -26,8 +26,6 @@ public BaseClockSource(bool skipAdvancesHigherThanNearestLimit = false)
+             toNotify = new List<Action>();
+             nearestLimitIn = TimeInterval.Maximal;
+             sync = new object();
+-            reupdateNeeded = new ThreadLocal<bool>();
+-            updateAlreadyInProgress = new ThreadLocal<bool>();
+         }
+ 
+         public virtual void ExecuteInLock(Action action)
+@@ -106,29 +104,142 @@ public virtual void ExchangeClockEntryWith(Action handler, Func<ClockEntry, Cloc
+         {
+             lock(sync)
+             {
+-                UpdateLimits();
+                 var indexOfEntry = FindEntryIndexByHandler(handler);
+ 
+                 if(indexOfEntry == -1)
+                 {
+                     if(factoryIfNonExistent != null)
+                     {
++                        UpdateLimits();
+                         clockEntries.Add(factoryIfNonExistent());
+                         clockEntriesUpdateHandlers.Add(null);
+                         unaccountedTimes.Add(TimeInterval.Empty);
+                         UpdateUpdateHandler(clockEntries.Count - 1);
++                        UpdateLimits();
+                     }
+                     else
+                     {
+                         throw new KeyNotFoundException();
+                     }
++                    return;
+                 }
+-                else
++
++                // The hot path: peripheral timer register writes land
++                // here (LimitTimer's Value/Limit/Enabled/Divider
++                // setters), tens of thousands of times a simulated
++                // second under a dshot input stream, and the former
++                // UpdateLimits pair advanced EVERY clock entry twice per
++                // call. Instead advance only the exchanged entry - fold
++                // its share of the pending time in under its OLD ratio
++                // and deposit the rest on the other entries, exactly as
++                // GetClockEntry does - then refresh nearestLimitIn with
++                // just the new entry's next event. nearestLimitIn can
++                // only shrink that way; if the exchanged entry was the
++                // nearest and moved later, the stale smaller value costs
++                // one harmless early Update, never a late event.
++                if(updateAlreadyInProgress)
+                 {
++                    // called from inside a limit handler: the running
++                    // Update owns the time bookkeeping; mutate and let
++                    // it re-run
+                     clockEntries[indexOfEntry] = visitor(clockEntries[indexOfEntry]);
+                     UpdateUpdateHandler(indexOfEntry);
++                    reupdateNeeded = true;
++                    return;
+                 }
+-                UpdateLimits();
++
++                var entry = clockEntries[indexOfEntry];
++                if(entry.Enabled)
++                {
++                    var updateHandler = clockEntriesUpdateHandlers[indexOfEntry];
++                    var reached = updateHandler(ref entry, elapsed + unaccountedTimes[indexOfEntry], ref nearestLimitIn);
++                    unaccountedTimes[indexOfEntry] = TimeInterval.Empty;
++                    clockEntries[indexOfEntry] = entry;
++
++                    var triggerFullUpdate = false;
++                    for(int j = 0; j < clockEntries.Count; ++j)
++                    {
++                        if(indexOfEntry != j && clockEntries[j].Enabled)
++                        {
++                            unaccountedTimes[j] += elapsed;
++                            triggerFullUpdate |= unaccountedTimes[j] >= nearestLimitIn;
++                        }
++                    }
++                    elapsed = TimeInterval.Empty;
++
++                    var firedHandlers = reached;
++                    if(reached)
++                    {
++                        FireHandlerGuarded(entry.Handler);
++                    }
++                    if(triggerFullUpdate || reupdateNeeded)
++                    {
++                        reupdateNeeded = false;
++                        UpdateLimits();
++                        firedHandlers = true;
++                    }
++                    if(firedHandlers)
++                    {
++                        // a fired handler can add or remove entries; the
++                        // saved index is stale
++                        indexOfEntry = FindEntryIndexByHandler(handler);
++                        if(indexOfEntry == -1)
++                        {
++                            // the handler removed this entry; behave as
++                            // the not-found path above
++                            if(factoryIfNonExistent == null)
++                            {
++                                throw new KeyNotFoundException();
++                            }
++                            clockEntries.Add(factoryIfNonExistent());
++                            clockEntriesUpdateHandlers.Add(null);
++                            unaccountedTimes.Add(TimeInterval.Empty);
++                            UpdateUpdateHandler(clockEntries.Count - 1);
++                            UpdateLimits();
++                            return;
++                        }
++                    }
++                }
++
++                clockEntries[indexOfEntry] = visitor(clockEntries[indexOfEntry]);
++                UpdateUpdateHandler(indexOfEntry);
++
++                var exchanged = clockEntries[indexOfEntry];
++                if(exchanged.Enabled)
++                {
++                    // a zero-length advance changes no state; it computes
++                    // the new entry's time to its next event and mins it
++                    // into nearestLimitIn (and fires the handler if the
++                    // exchange itself put the entry at its limit)
++                    var updateHandler = clockEntriesUpdateHandlers[indexOfEntry];
++                    var reached = updateHandler(ref exchanged, TimeInterval.Empty, ref nearestLimitIn);
++                    clockEntries[indexOfEntry] = exchanged;
++                    if(reached)
++                    {
++                        FireHandlerGuarded(exchanged.Handler);
++                    }
++                    if(reupdateNeeded)
++                    {
++                        reupdateNeeded = false;
++                        UpdateLimits();
++                    }
++                }
++            }
++        }
++
++        // Runs a limit handler with the update-in-progress guard set, so
++        // a handler that re-enters a setter takes the guarded branch
++        // above instead of recursing into the time bookkeeping.
++        private void FireHandlerGuarded(Action handler)
++        {
++            updateAlreadyInProgress = true;
++            try
++            {
++                handler();
++            }
++            finally
++            {
++                updateAlreadyInProgress = false;
+             }
+         }
+ 
+@@ -148,11 +259,11 @@ public virtual ClockEntry GetClockEntry(Action handler)
+                 {
+                     return result;
+                 }
+-                if(updateAlreadyInProgress.Value)
++                if(updateAlreadyInProgress)
+                 {
+                     return result;
+                 }
+-                updateAlreadyInProgress.Value = true;
++                updateAlreadyInProgress = true;
+                 try
+                 {
+                     var updateHandler = clockEntriesUpdateHandlers[i];
+@@ -165,7 +276,7 @@ public virtual ClockEntry GetClockEntry(Action handler)
+                 }
+                 finally
+                 {
+-                    updateAlreadyInProgress.Value = false;
++                    updateAlreadyInProgress = false;
+                 }
+                 clockEntries[i] = result;
+ 
+@@ -406,18 +517,18 @@ private void AdvanceInner(TimeInterval time, bool immediately)
+                     return;
+                 }
+ 
+-                if(updateAlreadyInProgress.Value)
++                if(updateAlreadyInProgress)
+                 {
+-                    reupdateNeeded.Value = true;
++                    reupdateNeeded = true;
+                 }
+                 else
+                 {
+                     var alreadyRunHandlers = new List<Action>();
+                     Update(elapsed, ref alreadyRunHandlers);
+                     // Check if another update was attempted in the meantime, e.g., a clock entry was updated within the handlers.
+-                    while(reupdateNeeded.Value)
++                    while(reupdateNeeded)
+                     {
+-                        reupdateNeeded.Value = false;
++                        reupdateNeeded = false;
+                         Update(TimeInterval.Empty, ref alreadyRunHandlers);
+                     }
+                 }
+@@ -442,13 +553,13 @@ private void UpdateLimits()
+ 
+         private void Update(TimeInterval time, ref List<Action> alreadyRunHandlers)
+         {
+-            if(updateAlreadyInProgress.Value)
++            if(updateAlreadyInProgress)
+             {
+                 return;
+             }
+             try
+             {
+-                updateAlreadyInProgress.Value = true;
++                updateAlreadyInProgress = true;
+                 lock(sync)
+                 {
+                     nearestLimitIn = TimeInterval.Maximal;
+@@ -483,7 +594,7 @@ private void Update(TimeInterval time, ref List<Action> alreadyRunHandlers)
+             }
+             finally
+             {
+-                updateAlreadyInProgress.Value = false;
++                updateAlreadyInProgress = false;
+             }
+         }
+ 
+@@ -504,9 +615,14 @@ private void UpdateUpdateHandler(int clockEntryIndex)
+         private TimeInterval totalElapsed;
+ 
+         [Constructor]
+-        private readonly ThreadLocal<bool> reupdateNeeded;
++        // Plain fields, not ThreadLocal: every access is under
++        // lock(sync), and the reentrancy they guard is same-thread
++        // (a limit handler calling back into the clock source). The
++        // ThreadLocal accessors were hot enough to show as
++        // __tls_get_addr in profiles of MMIO-heavy workloads.
++        private bool reupdateNeeded;
+         [Constructor]
+-        private readonly ThreadLocal<bool> updateAlreadyInProgress;
++        private bool updateAlreadyInProgress;
+         private readonly bool skipAdvancesHigherThanNearestLimit;
+         private readonly List<Action> toNotify;
+         private readonly List<ClockEntry> clockEntries;

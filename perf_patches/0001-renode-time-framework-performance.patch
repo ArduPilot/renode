@@ -1,0 +1,207 @@
+diff --git a/src/Emulator/Main/Time/BaseClockSource.cs b/src/Emulator/Main/Time/BaseClockSource.cs
+index 68f796a..a4298a5 100644
+--- a/src/Emulator/Main/Time/BaseClockSource.cs
++++ b/src/Emulator/Main/Time/BaseClockSource.cs
+@@ -38,11 +38,56 @@ public virtual void ExecuteInLock(Action action)
+             }
+         }
+ 
++        // Looks up a clock entry index by handler through a lazily
++        // maintained dictionary instead of a linear delegate-equality
++        // scan. The scan is on the hot path of every peripheral timer
++        // register read (LimitTimer.Value -> GetClockEntry) and its cost
++        // scales with the number of clock entries; profiled at ~49% of
++        // the emulation thread for an STM32 firmware polling a timer
++        // counter for its microsecond clock. The dictionary is rebuilt
++        // whenever it is missing (fresh deserialization), its size
++        // disagrees with the list (any add/remove path) or a hit fails
++        // verification (an in-place handler exchange), so every mutation
++        // path self-heals without bookkeeping at the mutation sites.
++        private int FindEntryIndexByHandler(Action handler)
++        {
++            if(handlerToEntryIndex == null || handlerToEntryIndex.Count != clockEntries.Count)
++            {
++                RebuildHandlerToEntryIndex();
++            }
++            int i;
++            if(handlerToEntryIndex.TryGetValue(handler, out i) && clockEntries[i].Handler == handler)
++            {
++                return i;
++            }
++            RebuildHandlerToEntryIndex();
++            return handlerToEntryIndex.TryGetValue(handler, out i) ? i : -1;
++        }
++
++        private void RebuildHandlerToEntryIndex()
++        {
++            if(handlerToEntryIndex == null)
++            {
++                handlerToEntryIndex = new Dictionary<Action, int>();
++            }
++            else
++            {
++                handlerToEntryIndex.Clear();
++            }
++            for(var i = 0; i < clockEntries.Count; i++)
++            {
++                handlerToEntryIndex[clockEntries[i].Handler] = i;
++            }
++        }
++
++        [Transient]
++        private Dictionary<Action, int> handlerToEntryIndex;
++
+         public virtual void AddClockEntry(ClockEntry entry)
+         {
+             lock(sync)
+             {
+-                if(clockEntries.FindIndex(x => x.Handler == entry.Handler) != -1)
++                if(FindEntryIndexByHandler(entry.Handler) != -1)
+                 {
+                     throw new ArgumentException("A clock entry with given handler already exists in the clock source.");
+                 }
+@@ -62,7 +107,7 @@ public virtual void ExchangeClockEntryWith(Action handler, Func<ClockEntry, Cloc
+             lock(sync)
+             {
+                 UpdateLimits();
+-                var indexOfEntry = clockEntries.FindIndex(x => x.Handler == handler);
++                var indexOfEntry = FindEntryIndexByHandler(handler);
+ 
+                 if(indexOfEntry == -1)
+                 {
+@@ -91,7 +136,7 @@ public virtual ClockEntry GetClockEntry(Action handler)
+         {
+             lock(sync)
+             {
+-                var i = clockEntries.IndexOf(x => x.Handler == handler);
++                var i = FindEntryIndexByHandler(handler);
+                 if(i == -1)
+                 {
+                     throw new KeyNotFoundException();
+@@ -152,12 +197,12 @@ public virtual void GetClockEntryInLockContext(Action handler, Action<ClockEntry
+             lock(sync)
+             {
+                 UpdateLimits();
+-                var result = clockEntries.FirstOrDefault(x => x.Handler == handler);
+-                if(result.Handler == null)
++                var entryIndex = FindEntryIndexByHandler(handler);
++                if(entryIndex == -1)
+                 {
+                     throw new KeyNotFoundException();
+                 }
+-                visitor(result);
++                visitor(clockEntries[entryIndex]);
+             }
+         }
+ 
+@@ -167,7 +212,7 @@ public virtual bool TryRemoveClockEntry(Action handler)
+             lock(sync)
+             {
+                 oldCount = clockEntries.Count;
+-                var indexToRemove = clockEntries.FindIndex(x => x.Handler == handler);
++                var indexToRemove = FindEntryIndexByHandler(handler);
+                 if(indexToRemove == -1)
+                 {
+                     return false;
+@@ -271,26 +316,40 @@ public bool HasEntries
+ 
+         public event Action<int, int> NumberOfEntriesChanged;
+ 
++        // Both direction handlers do their arithmetic on raw numerators
++        // over the ratio's fixed denominator instead of through Fraction
++        // operators: every Fraction multiply/add/divide runs a GCD-based
++        // Reduce, and these handlers run for each enabled clock entry on
++        // every update - profiled at ~21% of the emulation thread as
++        // Fraction.Reduce/GCD/op_Addition for a firmware that polls a
++        // timer counter for its microsecond clock. The residuum always
++        // originates as (x mod den), so any reduced form of it has a
++        // denominator dividing den and the rebase below is exact.
+         private static bool HandleDirectionDescendingPositiveRatio(ref ClockEntry entry, TimeInterval time, ref TimeInterval nearestTickIn)
+         {
+-            var emulatorTicks = time.Ticks;
+-            var entryTicks = emulatorTicks * entry.Ratio + entry.ValueResiduum;
+-            var isReached = entryTicks.Integer >= entry.Value;
+-            entry.ValueResiduum = entryTicks.Fractional;
++            var num = entry.Ratio.Numerator;
++            var den = entry.Ratio.Denominator;
++            var residuum = entry.ValueResiduum;
++            var total = time.Ticks * num + residuum.Numerator * (den / residuum.Denominator);
++            var wholeTicks = total / den;
++            var residNum = total % den;
++            var isReached = wholeTicks >= entry.Value;
+             if(isReached)
+             {
+                 entry.Value = entry.Period;
+                 entry.ValueResiduum = Fraction.Zero;
++                residNum = 0;
+                 entry = entry.With(enabled: entry.Enabled & (entry.WorkMode != WorkMode.OneShot));
+             }
+             else
+             {
+-                entry.Value -= entryTicks.Integer;
++                entry.Value -= wholeTicks;
++                entry.ValueResiduum = residNum == 0 ? Fraction.Zero : Fraction.CreateUnreduced(residNum, den);
+             }
+ 
+-            var emulatorTicksToLimit = (entry.Value - entry.ValueResiduum) / entry.Ratio;
+-            var wholeTicksToLimit = emulatorTicksToLimit.Integer;
+-            if(wholeTicksToLimit < uint.MaxValue && emulatorTicksToLimit.Fractional.Numerator != 0)
++            var ticksToLimitScaled = entry.Value * den - residNum;
++            var wholeTicksToLimit = ticksToLimitScaled / num;
++            if(wholeTicksToLimit < uint.MaxValue && ticksToLimitScaled % num != 0)
+             {
+                 wholeTicksToLimit += 1;
+             }
+@@ -300,23 +359,27 @@ private static bool HandleDirectionDescendingPositiveRatio(ref ClockEntry entry,
+ 
+         private static bool HandleDirectionAscendingPositiveRatio(ref ClockEntry entry, TimeInterval time, ref TimeInterval nearestTickIn)
+         {
+-            var emulatorTicks = time.Ticks;
+-            var entryTicks = emulatorTicks * entry.Ratio + entry.ValueResiduum;
++            var num = entry.Ratio.Numerator;
++            var den = entry.Ratio.Denominator;
++            var residuum = entry.ValueResiduum;
++            var total = time.Ticks * num + residuum.Numerator * (den / residuum.Denominator);
++            var residNum = total % den;
+             var isReached = false;
+-            entry.Value += entryTicks.Integer;
+-            entry.ValueResiduum = entryTicks.Fractional;
++            entry.Value += total / den;
++            entry.ValueResiduum = residNum == 0 ? Fraction.Zero : Fraction.CreateUnreduced(residNum, den);
+ 
+             if(entry.Value >= entry.Period)
+             {
+                 isReached = true;
+                 entry.Value = 0;
+                 entry.ValueResiduum = Fraction.Zero;
++                residNum = 0;
+                 entry = entry.With(enabled: entry.Enabled & (entry.WorkMode != WorkMode.OneShot));
+             }
+ 
+-            var emulatorTicksToLimit = (entry.Period - entry.Value - entry.ValueResiduum) / entry.Ratio;
+-            var wholeTicksToLimit = emulatorTicksToLimit.Integer;
+-            if(wholeTicksToLimit < uint.MaxValue && emulatorTicksToLimit.Fractional.Numerator != 0)
++            var ticksToLimitScaled = (entry.Period - entry.Value) * den - residNum;
++            var wholeTicksToLimit = ticksToLimitScaled / num;
++            if(wholeTicksToLimit < uint.MaxValue && ticksToLimitScaled % num != 0)
+             {
+                 wholeTicksToLimit += 1;
+             }
+diff --git a/src/Emulator/Main/Utilities/Fraction.cs b/src/Emulator/Main/Utilities/Fraction.cs
+index d150be3..0a9ed8a 100644
+--- a/src/Emulator/Main/Utilities/Fraction.cs
++++ b/src/Emulator/Main/Utilities/Fraction.cs
+@@ -258,6 +258,13 @@ public override string ToString()
+ 
+         public static readonly Fraction Zero = new Fraction(0, 1, skipReduce: true);
+ 
++        // for callers that guarantee the value is already in the wanted
++        // form and sit on paths too hot for a GCD per construction
++        internal static Fraction CreateUnreduced(ulong numerator, ulong denominator)
++        {
++            return new Fraction(numerator, denominator, false, skipReduce: true);
++        }
++
+         private Fraction(ulong numerator, ulong denominator, bool minus = false, bool skipReduce = false)
+         {
+             // Denominator cannot be zero. If the numerator is 0, represent as 0/1 (see Zero)

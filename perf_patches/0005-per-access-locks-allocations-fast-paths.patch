@@ -1,0 +1,627 @@
+diff --git a/src/Emulator/Main/Peripherals/Bus/PeripheralAccessMethods.cs b/src/Emulator/Main/Peripherals/Bus/PeripheralAccessMethods.cs
+index da21d3b28..56c74c122 100644
+--- a/src/Emulator/Main/Peripherals/Bus/PeripheralAccessMethods.cs
++++ b/src/Emulator/Main/Peripherals/Bus/PeripheralAccessMethods.cs
+@@ -25,9 +25,14 @@ public class PeripheralAccessMethods
+     {
+         public static PeripheralAccessMethods CreateWithLock()
+         {
+-            // Thread ownership tracking should be enabled. We use the IsHeldByCurrentThread
+-            // property to simulate recursive locking on spinlocks
+-            return new PeripheralAccessMethods { Lock = new SpinLock(true) };
++            // A plain object locked with Monitor, not a SpinLock: the
++            // owner-tracked SpinLock this used to be pays the tracked
++            // slow path (ContinueTryEnter plus a managed-thread-id
++            // lookup) on EVERY entry, and that is the path of every bus
++            // access. Monitor's uncontended thin lock is cheaper and is
++            // naturally reentrant, which is what IsHeldByCurrentThread
++            // was simulating.
++            return new PeripheralAccessMethods { Lock = new object() };
+         }
+ 
+         public PeripheralAccessMethods()
+@@ -204,8 +209,8 @@ public bool HasWrappersOfType(Type readWrapperType, Type writeWrapperType)
+         public Action<ulong> SetAbsoluteAddress;
+         public IBusPeripheral Peripheral;
+         public string Tag;
+-        [Constructor(true)]
+-        public SpinLock Lock;
++        [Constructor]
++        public object Lock;
+ 
+         private static void SetReadOrWriteMethod<TR, TW>(MethodInfo i, object obj, BusAccess.Operation operation, ref TR readMethod, ref TW writeMethod)
+         {
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBus.cs b/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
+index e8fca9eb5..1a9df35f4 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
+@@ -400,9 +400,16 @@ public IEnumerable<BusRangeRegistration> GetRegistrationPoints(IBusPeripheral pe
+ 
+         public IDisposable SetLocalContext(IPeripheral context, ulong? initiatorState = null)
+         {
++            // interface-compatible, boxing form; the generated access
++            // path uses the allocation-free struct scope below
+             return threadLocalContext.Initialize(context, initiatorState);
+         }
+ 
++        internal LocalContextScope SetLocalContextScoped(IPeripheral context, ulong? initiatorState = null)
++        {
++            return threadLocalContext.InitializeScoped(context, initiatorState);
++        }
++
+         public IReadOnlyDictionary<string, int> GetStateBits(string initiatorName)
+         {
+             if(string.IsNullOrEmpty(initiatorName))
+@@ -490,11 +497,23 @@ public void Clear()
+         /// <returns>True if any part of the <c>range</c> is locked for the given CPU (globally if <c>null</c> passed as <c>context</c>).</returns>
+         public bool IsAddressRangeLocked(Range range, IPeripheral context = null)
+         {
++            // On the path of every bus access, while locked ranges are a
++            // rarity: the full check below takes two ContextKeyDictionary
++            // locks per call, which profiled at over 2% of the emulation
++            // thread on lock-free machines. anyAddressRangeLocked is
++            // maintained by SetAddressRangeLocked; it can only be stale
++            // in the direction of taking the slow path.
++            if(!anyAddressRangeLocked)
++            {
++                return false;
++            }
+             // The locked range is either mapped for the CPU context, or globally (that is the reason for the OR)
+             return (lockedRangesCollectionByContext.TryGetValue(context, initiatorState: null, out var collection) && collection.ContainsOverlappingRange(range))
+                 || lockedRangesCollectionByContext[null].ContainsOverlappingRange(range);
+         }
+ 
++        private volatile bool anyAddressRangeLocked;
++
+         public void SetPeripheralEnabled(IPeripheral peripheral, bool enabled)
+         {
+             if(enabled)
+@@ -522,6 +541,15 @@ public void SetAddressRangeLocked(Range range, bool locked, IPeripheral context
+ 
+                 using(Machine.ObtainPausedState(internalPause: true))
+                 {
++                    if(locked)
++                    {
++                        // raise BEFORE the range becomes visible so no
++                        // concurrent access can fast-path past a
++                        // just-locked range; stale true only costs the
++                        // slow lookup
++                        anyAddressRangeLocked = true;
++                    }
++
+                     RelockRange(range, locked, context);
+ 
+                     lockedRangesCollectionByContext.WithStateCollection(context, stateMask: null, collection =>
+@@ -535,6 +563,27 @@ public void SetAddressRangeLocked(Range range, bool locked, IPeripheral context
+                             collection.Remove(range);
+                         }
+                     });
++
++                    if(!locked)
++                    {
++                        // recount across the global collection and every
++                        // context and state key (GetAllContextKeys does
++                        // NOT include the global null context); an
++                        // unlock is rare and this is the only place the
++                        // flag can go false
++                        var any = false;
++                        foreach(var contextKey in lockedRangesCollectionByContext.GetAllContextKeys().Concat(new IPeripheral[] { null }))
++                        {
++                            foreach(var stateKey in lockedRangesCollectionByContext.GetAllStateKeys(contextKey))
++                            {
++                                lockedRangesCollectionByContext.WithStateCollection(contextKey, stateKey, c =>
++                                {
++                                    any |= c.Count > 0;
++                                });
++                            }
++                        }
++                        anyAddressRangeLocked = any;
++                    }
+                 }
+             }
+         }
+@@ -848,6 +897,17 @@ public bool TryGetCurrentContextState<T>(out IPeripheralWithTransactionState cpu
+ 
+         public bool TryGetCurrentCPU(out ICPU cpu)
+         {
++            // Fast path: the per-access local context set by the bus
++            // access wrappers already names the initiating cpu; answering
++            // from it needs one thread-local read and no locks, where the
++            // general path below pays a reader-writer lock and two
++            // dictionary lookups - per bus access on some peripherals'
++            // register callbacks.
++            if(threadLocalContext.ActiveInitiator is ICPU fromContext)
++            {
++                cpu = fromContext;
++                return true;
++            }
+             cpuSync.EnterReadLock();
+             try
+             {
+@@ -2663,42 +2723,97 @@ public ulong PeripheralOffset
+             private readonly ICPUWithMappedMemory context;
+         }
+ 
+-        private class ThreadLocalContext : IDisposable
++        // The per-access context used to cost three heap allocations
++        // per bus access (a Tuple, a DisposableWrapper and its closure)
++        // plus four accesses to a values-tracking ThreadLocal - the
++        // single largest allocation source in MMIO-heavy emulation.
++        // Now: one mutable holder object per thread, allocated once,
++        // and a struct scope that saves and restores the previous
++        // context by value. The IDisposable Initialize form is kept
++        // for interface compatibility; it boxes the scope.
++        internal struct LocalContextScope : IDisposable
++        {
++            internal LocalContextScope(ThreadLocalContext.Holder holder, IPeripheral prevInitiator, ulong? prevState, bool prevInUse)
++            {
++                this.holder = holder;
++                this.prevInitiator = prevInitiator;
++                this.prevState = prevState;
++                this.prevInUse = prevInUse;
++            }
++
++            public void Dispose()
++            {
++                if(holder == null)
++                {
++                    return;
++                }
++                holder.Initiator = prevInitiator;
++                holder.State = prevState;
++                holder.InUse = prevInUse;
++            }
++
++            private readonly ThreadLocalContext.Holder holder;
++            private readonly IPeripheral prevInitiator;
++            private readonly ulong? prevState;
++            private readonly bool prevInUse;
++        }
++
++        internal class ThreadLocalContext : IDisposable
+         {
+             public ThreadLocalContext()
+             {
+-                context = new ThreadLocal<Tuple<IPeripheral, ulong?>>(() => null, true);
+-                emptyDisposable.Disable();
++                perThread = new ThreadLocal<Holder>(() => new Holder(), false);
+             }
+ 
+             public IDisposable Initialize(IPeripheral cpu, ulong? initiatorState)
++            {
++                return InitializeScoped(cpu, initiatorState);
++            }
++
++            public LocalContextScope InitializeScoped(IPeripheral cpu, ulong? initiatorState)
+             {
+                 if(cpu == null)
+                 {
+-                    return emptyDisposable;
++                    return default(LocalContextScope);
+                 }
+-                var previousContext = context.Value;
+-                context.Value = Tuple.Create(cpu, initiatorState);
+-                return DisposableWrapper.New(() =>
+-                {
+-                    context.Value = previousContext;
+-                });
++                var holder = perThread.Value;
++                var scope = new LocalContextScope(holder, holder.Initiator, holder.State, holder.InUse);
++                holder.Initiator = cpu;
++                holder.State = initiatorState;
++                holder.InUse = true;
++                return scope;
+             }
+ 
+             public void Dispose()
+             {
+-                context.Dispose();
++                perThread.Dispose();
+             }
+ 
+-            public bool InUse => context.Value != null;
++            public bool InUse => perThread.Value.InUse;
+ 
+-            public IPeripheral Initiator => context.Value.Item1;
++            // single thread-local read for the hot path; null when no
++            // context is active on this thread
++            public IPeripheral ActiveInitiator
++            {
++                get
++                {
++                    var holder = perThread.Value;
++                    return holder.InUse ? holder.Initiator : null;
++                }
++            }
++
++            public IPeripheral Initiator => perThread.Value.Initiator;
+ 
+-            public ulong? InitiatorState => context.Value.Item2;
++            public ulong? InitiatorState => perThread.Value.State;
+ 
+-            private readonly ThreadLocal<Tuple<IPeripheral, ulong?>> context;
++            internal sealed class Holder
++            {
++                public IPeripheral Initiator;
++                public ulong? State;
++                public bool InUse;
++            }
+ 
+-            private static readonly DisposableWrapper emptyDisposable = new DisposableWrapper();
++            private readonly ThreadLocal<Holder> perThread;
+         }
+ 
+         // It doesn't implement IDictionary because serialization doesn't work correctly for dictionaries without two generic parameters.
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
+index 79d6dbb70..77d764d1d 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
+@@ -8,6 +8,7 @@
+ */
+ 
+ using System;
++using System.Threading;
+ 
+ using Antmicro.Renode.Core;
+ using Antmicro.Renode.Exceptions;
+@@ -41,7 +42,7 @@ public byte ReadByte(ulong address, IPeripheral context = null, ulong? cpuState
+                 return 0;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -73,10 +74,7 @@ public byte ReadByte(ulong address, IPeripheral context = null, ulong? cpuState
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -87,7 +85,7 @@ public byte ReadByte(ulong address, IPeripheral context = null, ulong? cpuState
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -125,7 +123,7 @@ public void WriteByte(ulong address, byte value, IPeripheral context = null, ulo
+                 return;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -155,10 +153,7 @@ public void WriteByte(ulong address, byte value, IPeripheral context = null, ulo
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -173,7 +168,7 @@ public void WriteByte(ulong address, byte value, IPeripheral context = null, ulo
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -211,7 +206,7 @@ public ushort ReadWord(ulong address, IPeripheral context = null, ulong? cpuStat
+                 return 0;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -243,10 +238,7 @@ public ushort ReadWord(ulong address, IPeripheral context = null, ulong? cpuStat
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -257,7 +249,7 @@ public ushort ReadWord(ulong address, IPeripheral context = null, ulong? cpuStat
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -295,7 +287,7 @@ public void WriteWord(ulong address, ushort value, IPeripheral context = null, u
+                 return;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -325,10 +317,7 @@ public void WriteWord(ulong address, ushort value, IPeripheral context = null, u
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -343,7 +332,7 @@ public void WriteWord(ulong address, ushort value, IPeripheral context = null, u
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -381,7 +370,7 @@ public uint ReadDoubleWord(ulong address, IPeripheral context = null, ulong? cpu
+                 return 0;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -413,10 +402,7 @@ public uint ReadDoubleWord(ulong address, IPeripheral context = null, ulong? cpu
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -427,7 +413,7 @@ public uint ReadDoubleWord(ulong address, IPeripheral context = null, ulong? cpu
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -465,7 +451,7 @@ public void WriteDoubleWord(ulong address, uint value, IPeripheral context = nul
+                 return;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -495,10 +481,7 @@ public void WriteDoubleWord(ulong address, uint value, IPeripheral context = nul
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -513,7 +496,7 @@ public void WriteDoubleWord(ulong address, uint value, IPeripheral context = nul
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -551,7 +534,7 @@ public ulong ReadQuadWord(ulong address, IPeripheral context = null, ulong? cpuS
+                 return 0;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -583,10 +566,7 @@ public ulong ReadQuadWord(ulong address, IPeripheral context = null, ulong? cpuS
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -597,7 +577,7 @@ public ulong ReadQuadWord(ulong address, IPeripheral context = null, ulong? cpuS
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -635,7 +615,7 @@ public void WriteQuadWord(ulong address, ulong value, IPeripheral context = null
+                 return;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -665,10 +645,7 @@ public void WriteQuadWord(ulong address, ulong value, IPeripheral context = null
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -683,7 +660,7 @@ public void WriteQuadWord(ulong address, ulong value, IPeripheral context = null
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
+index d2721f4bb..462285ae6 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
+@@ -26,6 +26,7 @@
+ */
+ 
+ using System;
++using System.Threading;
+ 
+ using Antmicro.Renode.Core;
+ using Antmicro.Renode.Exceptions;
+@@ -65,7 +66,7 @@ namespace Antmicro.Renode.Peripherals.Bus
+                 return 0;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -97,10 +98,7 @@ namespace Antmicro.Renode.Peripherals.Bus
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -111,7 +109,7 @@ namespace Antmicro.Renode.Peripherals.Bus
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+@@ -149,7 +147,7 @@ namespace Antmicro.Renode.Peripherals.Bus
+                 return;
+             }
+ 
+-            using(SetLocalContext(context, cpuState))
++            using(SetLocalContextScoped(context, cpuState))
+             {
+                 TagEntry? tag = null;
+                 if(MayHaveOverridingTag())
+@@ -179,10 +177,7 @@ namespace Antmicro.Renode.Peripherals.Bus
+                 var lockTaken = false;
+                 try
+                 {
+-                    if(!accessMethods.Lock.IsHeldByCurrentThread)
+-                    {
+-                        accessMethods.Lock.Enter(ref lockTaken);
+-                    }
++                    Monitor.Enter(accessMethods.Lock, ref lockTaken);
+                     if(accessMethods.SetAbsoluteAddress != null)
+                     {
+                         accessMethods.SetAbsoluteAddress(address);
+@@ -197,7 +192,7 @@ namespace Antmicro.Renode.Peripherals.Bus
+                 {
+                     if(lockTaken)
+                     {
+-                        accessMethods.Lock.Exit();
++                        Monitor.Exit(accessMethods.Lock);
+                     }
+                 }
+             }
+diff --git a/src/Emulator/Main/Time/BaseClockSource.cs b/src/Emulator/Main/Time/BaseClockSource.cs
+index 97a5f2a71..1f7cd3cbe 100644
+--- a/src/Emulator/Main/Time/BaseClockSource.cs
++++ b/src/Emulator/Main/Time/BaseClockSource.cs
+@@ -280,23 +280,31 @@ public virtual ClockEntry GetClockEntry(Action handler)
+                 }
+                 clockEntries[i] = result;
+ 
+-                // Clear elapsed and deposit it as unaccounted time on all other enabled clock entries
+-                var triggerFullUpdate = false;
+-                for(int j = 0; j < clockEntries.Count; ++j)
++                // Clear elapsed and deposit it as unaccounted time on
++                // all other enabled clock entries. With no elapsed time
++                // pending - the common case for a read landing right
++                // after an advance - there is nothing to deposit and the
++                // O(entries) loop is skipped entirely; this path runs on
++                // every timer counter read.
++                if(elapsed.Ticks != 0)
+                 {
+-                    if(i != j && clockEntries[j].Enabled)
++                    var triggerFullUpdate = false;
++                    for(int j = 0; j < clockEntries.Count; ++j)
+                     {
+-                        unaccountedTimes[j] += elapsed;
+-                        triggerFullUpdate |= unaccountedTimes[j] >= nearestLimitIn;
++                        if(i != j && clockEntries[j].Enabled)
++                        {
++                            unaccountedTimes[j] += elapsed;
++                            triggerFullUpdate |= unaccountedTimes[j] >= nearestLimitIn;
++                        }
+                     }
+-                }
+-                elapsed = TimeInterval.Empty;
++                    elapsed = TimeInterval.Empty;
+ 
+-                if(triggerFullUpdate)
+-                {
+-                    UpdateLimits();
+-                    // unaccountedTimes cleared by Update
+-                    result = clockEntries[i];
++                    if(triggerFullUpdate)
++                    {
++                        UpdateLimits();
++                        // unaccountedTimes cleared by Update
++                        result = clockEntries[i];
++                    }
+                 }
+ 
+                 return result;

@@ -1,0 +1,279 @@
+diff --git a/src/Emulator/Main/Peripherals/Bus/PeripheralCollection.cs b/src/Emulator/Main/Peripherals/Bus/PeripheralCollection.cs
+index e170471b9..16c10f341 100644
+--- a/src/Emulator/Main/Peripherals/Bus/PeripheralCollection.cs
++++ b/src/Emulator/Main/Peripherals/Bus/PeripheralCollection.cs
+@@ -83,6 +83,7 @@ public void Add(ulong start, ulong end, IBusRegistered<IBusPeripheral> periphera
+                     if(!goToDictionary)
+                     {
+                         RefreshPeripheralsCache();
++                        InvalidateLastBlock();
+                         return;
+                     }
+                     // note that truncating is in fact good thing here
+@@ -91,6 +92,7 @@ public void Add(ulong start, ulong end, IBusRegistered<IBusPeripheral> periphera
+                         shortBlocks.Add(start + i * PageSize, block);
+                     }
+                     RefreshPeripheralsCache();
++                    InvalidateLastBlock();
+                     sysbus.NoisyLog("Added {0} to dictionary.", name);
+                 }
+                 finally
+@@ -364,6 +366,7 @@ private int BinarySearch(ulong offset)
+             private void InvalidateLastBlock()
+             {
+                 lastBlockStorage = new ThreadLocal<Block>();
++                sysbus.InvalidateFindAccessCache();
+             }
+ 
+             private IBusRegistered<IBusPeripheral>[] peripherals = Array.Empty<IBusRegistered<IBusPeripheral>>();
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBus.cs b/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
+index 3cfe83482..e8fca9eb5 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBus.cs
+@@ -2310,6 +2310,67 @@ private bool RemoveMappingsForPeripheral(IBusPeripheral peripheral)
+             return true;
+         }
+ 
++        // The TryFindPeripheralAccessMethods fast path: a small
++        // per-address-page cache of resolved access methods, so the
++        // dominant same-peripheral access streaks (interrupt-controller
++        // words, timer counter polls) skip the per-access context
++        // resolution, dictionaries and locks. Entries are immutable
++        // objects swapped by volatile reference, so a reader can never
++        // observe a torn entry; a version stamp bumped on any peripheral
++        // collection change (registration, move, removal, per-context
++        // changes) invalidates every entry at once. A stale version can
++        // only cause a re-resolve, never a wrong hit.
++        // diagnostics for the access cache, readable from the monitor:
++        // sysbus FindCacheStats
++        public string FindCacheStats => $"hits={findHits} misses={findMisses} invalidations={findInvalidations} version={findAccessVersion} hasCtx={hasContextRegistrations}";
++        [Transient]
++        internal long findHits;
++        [Transient]
++        internal long findMisses;
++        [Transient]
++        internal long findInvalidations;
++
++        internal void InvalidateFindAccessCache()
++        {
++            findInvalidations++;
++            // With per-context (per-CPU) registrations present, a
++            // context==null lookup resolves through the CURRENT cpu, so
++            // a null-keyed cache entry could alias across cpus - forbid
++            // caching those on such machines. Computed here, off the
++            // hot path; conservative (true) when the collections are
++            // not yet constructed. Updated BEFORE the version bump so
++            // a lookup that sees the new version also sees the new flag.
++            try
++            {
++                hasContextRegistrations =
++                    peripheralsCollectionByContext.GetAllContextKeys().Any(x => x != null);
++            }
++            catch(NullReferenceException)
++            {
++                hasContextRegistrations = true;
++            }
++            findAccessVersion++;
++        }
++
++        private volatile bool hasContextRegistrations = true;
++
++        internal sealed class FindAccessCacheEntry
++        {
++            public int Version;
++            public IPeripheral Context;
++            public ulong? CpuState;
++            public ulong Start;
++            public ulong End;
++            public ulong Offset;
++            public PeripheralAccessMethods Methods;
++        }
++
++        // [Transient]: the cached PeripheralAccessMethods delegates must
++        // not be serialized; a fresh array simply refills on first use
++        [Transient]
++        internal FindAccessCacheEntry[] findAccessCache;
++        internal volatile int findAccessVersion;
++
+         // Nearly no tag overrides peripheral accesses, yet the
+         // generated access path consulted the tag list on every bus
+         // access just in case one did. The count is recomputed lazily
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
+index 56ce18b57..79d6dbb70 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.cs
+@@ -883,23 +883,59 @@ public void SetHookBeforePeripheralWrite<T>(IBusPeripheral peripheral, Func<T, l
+ 
+         private bool TryFindPeripheralAccessMethods(ulong address, IPeripheral context, out PeripheralAccessMethods accessMethods, out ulong startAddress, out ulong offset, ulong? cpuState = null)
+         {
++            var slot = (int)((address >> 10) & 0xF);
++            var cache = findAccessCache ?? (findAccessCache = new FindAccessCacheEntry[16]);
++            var cached = cache[slot];
++            if(cached != null && cached.Version == findAccessVersion && ReferenceEquals(cached.Context, context)
++                && cached.CpuState == cpuState && address >= cached.Start && address < cached.End)
++            {
++                findHits++;
++                accessMethods = cached.Methods;
++                startAddress = cached.Start;
++                offset = cached.Offset;
++                return true;
++            }
++            findMisses++;
++            // Capture the version BEFORE resolving: if a registration
++            // change races the lookup, the entry is published with the
++            // pre-change version and the next access re-resolves,
++            // instead of stamping a stale peripheral as current.
++            var version = findAccessVersion;
++            var contextIn = context;
+             if(context == null)
+             {
+                 TryGetCurrentCPU(out var cpu);
+                 context = cpu;
+             }
++            ulong endAddress;
+             if(context != null)
+             {
+                 if(peripheralsCollectionByContext.TryGetValue(context, cpuState, out var collection))
+                 {
+-                    accessMethods = collection.FindAccessMethods(address, out startAddress, out var _, out offset);
++                    accessMethods = collection.FindAccessMethods(address, out startAddress, out endAddress, out offset);
+                     if(accessMethods != null)
+                     {
++                        if(contextIn != null || !hasContextRegistrations)
++                        {
++                            cache[slot] = new FindAccessCacheEntry
++                            {
++                                Version = version, Context = contextIn, CpuState = cpuState,
++                                Start = startAddress, End = endAddress, Offset = offset, Methods = accessMethods,
++                            };
++                        }
+                         return true;
+                     }
+                 }
+             }
+-            accessMethods = peripheralsCollectionByContext[null].FindAccessMethods(address, out startAddress, out _, out offset);
++            accessMethods = peripheralsCollectionByContext[null].FindAccessMethods(address, out startAddress, out endAddress, out offset);
++            if(accessMethods != null && (contextIn == null ? !hasContextRegistrations : true))
++            {
++                cache[slot] = new FindAccessCacheEntry
++                {
++                    Version = version, Context = contextIn, CpuState = cpuState,
++                    Start = startAddress, End = endAddress, Offset = offset, Methods = accessMethods,
++                };
++            }
+             return accessMethods != null;
+         }
+     }
+diff --git a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
+index 4fb04d4f9..d2721f4bb 100644
+--- a/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
++++ b/src/Emulator/Main/Peripherals/Bus/SystemBusGenerated.tt
+@@ -270,23 +270,57 @@ namespace Antmicro.Renode.Peripherals.Bus
+ #>
+         private bool TryFindPeripheralAccessMethods(ulong address, IPeripheral context, out PeripheralAccessMethods accessMethods, out ulong startAddress, out ulong offset, ulong? cpuState = null)
+         {
++            var slot = (int)((address >> 10) & 0xF);
++            var cache = findAccessCache ?? (findAccessCache = new FindAccessCacheEntry[16]);
++            var cached = cache[slot];
++            if(cached != null && cached.Version == findAccessVersion && ReferenceEquals(cached.Context, context)
++                && cached.CpuState == cpuState && address >= cached.Start && address < cached.End)
++            {
++                accessMethods = cached.Methods;
++                startAddress = cached.Start;
++                offset = cached.Offset;
++                return true;
++            }
++            // Capture the version BEFORE resolving: if a registration
++            // change races the lookup, the entry is published with the
++            // pre-change version and the next access re-resolves,
++            // instead of stamping a stale peripheral as current.
++            var version = findAccessVersion;
++            var contextIn = context;
+             if(context == null)
+             {
+                 TryGetCurrentCPU(out var cpu);
+                 context = cpu;
+             }
++            ulong endAddress;
+             if(context != null)
+             {
+                 if(peripheralsCollectionByContext.TryGetValue(context, cpuState, out var collection))
+                 {
+-                    accessMethods = collection.FindAccessMethods(address, out startAddress, out var _, out offset);
++                    accessMethods = collection.FindAccessMethods(address, out startAddress, out endAddress, out offset);
+                     if(accessMethods != null)
+                     {
++                        if(contextIn != null || !hasContextRegistrations)
++                        {
++                            cache[slot] = new FindAccessCacheEntry
++                            {
++                                Version = version, Context = contextIn, CpuState = cpuState,
++                                Start = startAddress, End = endAddress, Offset = offset, Methods = accessMethods,
++                            };
++                        }
+                         return true;
+                     }
+                 }
+             }
+-            accessMethods = peripheralsCollectionByContext[null].FindAccessMethods(address, out startAddress, out _, out offset);
++            accessMethods = peripheralsCollectionByContext[null].FindAccessMethods(address, out startAddress, out endAddress, out offset);
++            if(accessMethods != null && (contextIn == null ? !hasContextRegistrations : true))
++            {
++                cache[slot] = new FindAccessCacheEntry
++                {
++                    Version = version, Context = contextIn, CpuState = cpuState,
++                    Start = startAddress, End = endAddress, Offset = offset, Methods = accessMethods,
++                };
++            }
+             return accessMethods != null;
+         }
+     }
+diff --git a/src/Emulator/Main/Time/BaseClockSource.cs b/src/Emulator/Main/Time/BaseClockSource.cs
+index b1d364cbb..97a5f2a71 100644
+--- a/src/Emulator/Main/Time/BaseClockSource.cs
++++ b/src/Emulator/Main/Time/BaseClockSource.cs
+@@ -523,7 +523,15 @@ private void AdvanceInner(TimeInterval time, bool immediately)
+                 }
+                 else
+                 {
+-                    var alreadyRunHandlers = new List<Action>();
++                    // reused rather than allocated: this path runs for
++                    // every advance that reaches a limit - tens of
++                    // thousands of times a simulated second - and the
++                    // list plus its backing array were a measurable
++                    // slice of the allocation rate. Guarded by `sync`
++                    // like everything else here.
++                    var alreadyRunHandlers = reusableAlreadyRunHandlers
++                        ?? (reusableAlreadyRunHandlers = new List<Action>());
++                    alreadyRunHandlers.Clear();
+                     Update(elapsed, ref alreadyRunHandlers);
+                     // Check if another update was attempted in the meantime, e.g., a clock entry was updated within the handlers.
+                     while(reupdateNeeded)
+@@ -551,6 +559,9 @@ private void UpdateLimits()
+             AdvanceInner(TimeInterval.Empty, true);
+         }
+ 
++        // Only ever called from AdvanceInner, under lock(sync); the
++        // nested lock it used to take was pure monitor-enter/exit
++        // overhead on a recursive acquisition, paid per advance.
+         private void Update(TimeInterval time, ref List<Action> alreadyRunHandlers)
+         {
+             if(updateAlreadyInProgress)
+@@ -560,7 +571,6 @@ private void Update(TimeInterval time, ref List<Action> alreadyRunHandlers)
+             try
+             {
+                 updateAlreadyInProgress = true;
+-                lock(sync)
+                 {
+                     nearestLimitIn = TimeInterval.Maximal;
+                     for(var i = 0; i < clockEntries.Count; i++)
+@@ -621,6 +631,9 @@ private void UpdateUpdateHandler(int clockEntryIndex)
+         // ThreadLocal accessors were hot enough to show as
+         // __tls_get_addr in profiles of MMIO-heavy workloads.
+         private bool reupdateNeeded;
++
++        [Transient]
++        private List<Action> reusableAlreadyRunHandlers = new List<Action>();
+         [Constructor]
+         private bool updateAlreadyInProgress;
+         private readonly bool skipAdvancesHigherThanNearestLimit;
