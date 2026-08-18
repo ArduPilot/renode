@@ -1,0 +1,718 @@
+diff --git a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1AFIO.cs b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1AFIO.cs
+index 2cc37580a..fa96fa387 100644
+--- a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1AFIO.cs
++++ b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1AFIO.cs
+@@ -5,18 +5,29 @@
+ // Full license text is available in 'licenses/MIT.txt'.
+ //
+ using System.Collections.Generic;
++using System.Collections.ObjectModel;
+
+ using Antmicro.Renode.Core;
+ using Antmicro.Renode.Core.Structure.Registers;
++using Antmicro.Renode.Logging;
+ using Antmicro.Renode.Peripherals.Bus;
+
+ namespace Antmicro.Renode.Peripherals.GPIOPort
+ {
+     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
+-    public class STM32F1AFIO : BasicDoubleWordPeripheral, IKnownSize
++    public class STM32F1AFIO : BasicDoubleWordPeripheral, IKnownSize,
++                               INumberedGPIOOutput, ILocalGPIOReceiver
+     {
+         public STM32F1AFIO(Machine machine, STM32F1GPIOPort[] gpioPorts) : base(machine)
+         {
++            var connections = new Dictionary<int, IGPIO>();
++            for(var pin = 0; pin < NumberOfPins; pin++)
++            {
++                connections.Add(pin, new GPIO());
++            }
++            Connections = new ReadOnlyDictionary<int, IGPIO>(connections);
++            internalReceivers = new Dictionary<int, InternalReceiver>();
++
+             this.gpioPortA = gpioPorts[0];
+             this.gpioPortB = gpioPorts[1];
+             this.gpioPortC = gpioPorts[2];
+@@ -137,30 +148,14 @@ public STM32F1AFIO(Machine machine, STM32F1GPIOPort[] gpioPorts) : base(machine)
+                 .WithTaggedFlag("TIM2ITR1_REMAP", 29)
+                 .WithTaggedFlag("PTP_PPS_REMAP", 30)
+                 .WithReservedBits(31, 1));
+-            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt1, new DoubleWordRegister(this)
+-                .WithTag("EXTI0", 0, 4)
+-                .WithTag("EXTI1", 4, 4)
+-                .WithTag("EXTI2", 8, 4)
+-                .WithTag("EXTI3", 12, 4)
+-                .WithReservedBits(16, 16));
+-            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt2, new DoubleWordRegister(this)
+-                .WithTag("EXTI4", 0, 4)
+-                .WithTag("EXTI5", 4, 4)
+-                .WithTag("EXTI6", 8, 4)
+-                .WithTag("EXTI7", 12, 4)
+-                .WithReservedBits(16, 16));
+-            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt3, new DoubleWordRegister(this)
+-                .WithTag("EXTI8", 0, 4)
+-                .WithTag("EXTI9", 4, 4)
+-                .WithTag("EXTI10", 8, 4)
+-                .WithTag("EXTI11", 12, 4)
+-                .WithReservedBits(16, 16));
+-            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt4, new DoubleWordRegister(this)
+-                .WithTag("EXTI12", 0, 4)
+-                .WithTag("EXTI13", 4, 4)
+-                .WithTag("EXTI14", 8, 4)
+-                .WithTag("EXTI15", 12, 4)
+-                .WithReservedBits(16, 16));
++            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt1,
++                CreateExternalInterruptRegister(0));
++            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt2,
++                CreateExternalInterruptRegister(4));
++            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt3,
++                CreateExternalInterruptRegister(8));
++            RegistersCollection.AddRegister((long)Registers.ExternalInterrupt4,
++                CreateExternalInterruptRegister(12));
+             RegistersCollection.AddRegister((long)Registers.Map2, new DoubleWordRegister(this)
+                 .WithFlag(0, name: "TIM15_REMAP", writeCallback: (_, value) => TimRemapCallback(15, value), valueProviderCallback: _ => timRemaps[15] != 0)
+                 .WithFlag(1, name: "TIM16_REMAP", writeCallback: (_, value) => TimRemapCallback(16, value), valueProviderCallback: _ => timRemaps[16] != 0)
+@@ -183,6 +178,52 @@ public STM32F1AFIO(Machine machine, STM32F1GPIOPort[] gpioPorts) : base(machine)
+
+         public long Size => 0x400;
+
++        public IReadOnlyDictionary<int, IGPIO> Connections { get; }
++
++        public IGPIOReceiver GetLocalReceiver(int port)
++        {
++            if(!internalReceivers.TryGetValue(port, out var receiver))
++            {
++                receiver = new InternalReceiver(this, port);
++                internalReceivers.Add(port, receiver);
++            }
++            return receiver;
++        }
++
++        public override void Reset()
++        {
++            base.Reset();
++            foreach(var connection in Connections.Values)
++            {
++                connection.Unset();
++            }
++            foreach(var receiver in internalReceivers.Values)
++            {
++                for(var pin = 0; pin < NumberOfPins; pin++)
++                {
++                    receiver.UpdateGPIO(pin);
++                }
++            }
++        }
++
++        private DoubleWordRegister CreateExternalInterruptRegister(int firstPin)
++        {
++            var register = new DoubleWordRegister(this);
++            for(var field = 0; field < 4; field++)
++            {
++                var pin = firstPin + field;
++                extiMappings[pin] = register.DefineValueField(field * 4, 4,
++                    name: $"EXTI{pin}", changeCallback: (_, port) =>
++                    {
++                        Connections[pin].Unset();
++                        ((InternalReceiver)GetLocalReceiver((int)port))
++                            .UpdateGPIO(pin);
++                    });
++            }
++            register.WithReservedBits(16, 16);
++            return register;
++        }
++
+         private void TimRemapCallback(ulong timer, ulong newValue)
+         {
+             var oldValue = timRemaps[timer];
+@@ -223,9 +264,53 @@ private void TimRemapCallback(ulong timer, bool newValue)
+         private readonly STM32F1GPIOPort gpioPortE;
+         private readonly STM32F1GPIOPort gpioPortF;
+         private readonly STM32F1GPIOPort gpioPortG;
++        private readonly Dictionary<int, InternalReceiver> internalReceivers;
++        private readonly IValueRegisterField[] extiMappings =
++            new IValueRegisterField[NumberOfPins];
+         private static readonly int NoTimers = 18;
+         private readonly ulong[] timRemaps = new ulong[NoTimers];
+
++        private class InternalReceiver : IGPIOReceiver
++        {
++            public InternalReceiver(STM32F1AFIO parent, int port)
++            {
++                this.parent = parent;
++                this.port = port;
++                state = new bool[NumberOfPins];
++            }
++
++            public void OnGPIO(int pin, bool value)
++            {
++                if(pin < 0 || pin >= NumberOfPins)
++                {
++                    parent.Log(LogLevel.Error,
++                        "GPIO port {0}, pin {1}, is outside 0..{2}",
++                        port, pin, NumberOfPins - 1);
++                    return;
++                }
++                state[pin] = value;
++                UpdateGPIO(pin);
++            }
++
++            public void UpdateGPIO(int pin)
++            {
++                if((int)parent.extiMappings[pin].Value == port)
++                {
++                    parent.Connections[pin].Set(state[pin]);
++                }
++            }
++
++            public void Reset()
++            {
++                // Input levels belong to the connected GPIO ports. Those
++                // ports update this receiver when their pads reset.
++            }
++
++            private readonly STM32F1AFIO parent;
++            private readonly int port;
++            private readonly bool[] state;
++        }
++
+         private class GpioPinCollection : List<GpioPin>
+         {
+             public void Add(STM32F1GPIOPort gpio, int pin)
+@@ -263,5 +348,7 @@ private enum Registers
+             ExternalInterrupt4 = 0x14,
+             Map2 = 0x1c,
+         }
++
++        private const int NumberOfPins = 16;
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs
+index c3cfd62db..172d4ffb5 100644
+--- a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs
++++ b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs
+@@ -52,6 +52,8 @@ public STM32F1GPIOPort(IMachine machine, List<List<int>> invertedAFPins = null)
+
+             pins = new PinMode[NumberOfPorts];
+             pinsOutputMode = new OutputMode[NumberOfPorts];
++            outputData = new bool[NumberOfPorts];
++            externalInputs = new bool[NumberOfPorts];
+             AlternateFunctionOutputs = new GPIOAlternateFunction[NumberOfPorts];
+             for(var i = 0; i < NumberOfPorts; i++)
+             {
+@@ -65,10 +67,12 @@ public STM32F1GPIOPort(IMachine machine, List<List<int>> invertedAFPins = null)
+                 var lowId = offset / 4;
+                 var highId = lowId + 8;
+
+-                configurationLowRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{lowId}", writeCallback: (_, value) => pins[lowId] = value, valueProviderCallback: _ => pins[lowId]);
++                configurationLowRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{lowId}",
++                    writeCallback: (_, value) => ChangePinMode(lowId, value), valueProviderCallback: _ => pins[lowId]);
+                 configurationLowRegister.DefineEnumField<OutputMode>(offset + 2, 2, name: $"CNF{lowId}", writeCallback: (_, value) => ChangeOutputMode(lowId, value), valueProviderCallback: _ => pinsOutputMode[lowId]);
+
+-                configurationHighRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{highId}", writeCallback: (_, value) => pins[highId] = value, valueProviderCallback: _ => pins[highId]);
++                configurationHighRegister.DefineEnumField<PinMode>(offset, 2, name: $"MODE{highId}",
++                    writeCallback: (_, value) => ChangePinMode(highId, value), valueProviderCallback: _ => pins[highId]);
+                 configurationHighRegister.DefineEnumField<OutputMode>(offset + 2, 2, name: $"CNF{highId}", writeCallback: (_, value) => ChangeOutputMode(highId, value), valueProviderCallback: _ => pinsOutputMode[highId]);
+             }
+
+@@ -82,7 +86,8 @@ public STM32F1GPIOPort(IMachine machine, List<List<int>> invertedAFPins = null)
+                 },
+                 {(long)Registers.OutputData, new DoubleWordRegister(this)
+                     // upper 16 bits are reserved
+-                    .WithValueField(0, 16, name: "ODR", writeCallback: (_, value) => SetConnectionsStateUsingBits((uint)value), valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(Connections.Values.Select(x=>x.IsSet)))
++                    .WithValueField(0, 16, name: "ODR", writeCallback: (_, value) => WriteState((ushort)value),
++                        valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(outputData))
+                 },
+                 {(long)Registers.BitSetReset, new DoubleWordRegister(this)
+                     .WithValueField(16, 16, FieldMode.Write, name: "BR", writeCallback: (_, value) => SetBitsFromMask((uint)value, false))
+@@ -106,19 +111,15 @@ public override void OnGPIO(int number, bool value)
+                 return;
+             }
+
+-            if(pins[number] != PinMode.Input)
+-            {
+-                this.Log(LogLevel.Warning, "Received a signal on the output pin #{0}", number);
+-                return;
+-            }
+-
+-            base.OnGPIO(number, value);
+-            Connections[number].Set(value);
++            externalInputs[number] = value;
++            ResolvePin(number);
+         }
+
+         public override void Reset()
+         {
+             base.Reset();
++            System.Array.Clear(outputData, 0, outputData.Length);
++            System.Array.Clear(externalInputs, 0, externalInputs.Length);
+             registers.Reset();
+             for(var i = 0; i < NumberOfPorts; i++)
+             {
+@@ -162,31 +163,50 @@ private void WriteState(ushort value)
+         {
+             for(var i = 0; i < NumberOfPorts; i++)
+             {
+-                var state = ((value & 1u) == 1);
+-                WritePin(i, state);
++                outputData[i] = ((value & 1u) == 1);
++                ResolvePin(i);
+
+                 value >>= 1;
+             }
+         }
+
++        private void ChangePinMode(int number, PinMode newMode)
++        {
++            pins[number] = newMode;
++            ResolvePin(number);
++        }
++
+         private void ChangeOutputMode(int number, OutputMode newMode)
+         {
+             pinsOutputMode[number] = newMode;
+             AlternateFunctionOutputs[number].IsConnected = (newMode == OutputMode.AlternateFunctionOpenDrain || newMode == OutputMode.AlternateFunctionPushPull);
++            ResolvePin(number);
++        }
++
++        private void ResolvePin(int number)
++        {
++            bool value;
++            if(pins[number] == PinMode.Input)
++            {
++                value = externalInputs[number];
++            }
++            else if(AlternateFunctionOutputs[number].IsConnected)
++            {
++                value = AlternateFunctionOutputs[number].Value;
++            }
++            else
++            {
++                value = outputData[number];
++            }
++            WritePin(number, value);
+         }
+
+         private void SetBitsFromMask(uint mask, bool state)
+         {
+             foreach(var bit in BitHelper.GetSetBits(mask))
+             {
+-                if(pins[bit] == PinMode.Input)
+-                {
+-                    this.Log(LogLevel.Warning, "Trying to set the state of the input pin #{0}", bit);
+-                    continue;
+-                }
+-
+-                Connections[bit].Set(state);
+-                State[bit] = state;
++                outputData[bit] = state;
++                ResolvePin(bit);
+             }
+         }
+
+@@ -195,6 +215,8 @@ private void SetBitsFromMask(uint mask, bool state)
+         private readonly DoubleWordRegisterCollection registers;
+         private readonly PinMode[] pins;
+         private readonly OutputMode[] pinsOutputMode;
++        private readonly bool[] outputData;
++        private readonly bool[] externalInputs;
+
+         private const int NumberOfPorts = 16;
+         private const int NumberOfTimers = 18;
+@@ -205,18 +227,29 @@ public GPIOAlternateFunction(STM32F1GPIOPort port, int pin)
+             {
+                 this.port = port;
+                 this.pin = pin;
++                functionStates = new bool[NumberOfTimers];
+
+                 Reset();
+             }
+
+             public void Reset()
+             {
++                System.Array.Clear(functionStates, 0, functionStates.Length);
+                 IsConnected = false;
+                 ActiveFunction = 0;
+             }
+
+             public void OnGPIO(int number, bool value)
+             {
++                if(number < 0 || number >= functionStates.Length)
++                {
++                    this.Log(LogLevel.Error,
++                        "Alternate function number must be between 0 and {0}, but {1} was given instead.",
++                        functionStates.Length - 1, number);
++                    return;
++                }
++
++                functionStates[number] = value;
+                 if(!IsConnected || number != activeFunction)
+                 {
+                     // Don't emit any log as it is valid to receive signals from AFs when they are not active.
+@@ -230,7 +263,24 @@ public void OnGPIO(int number, bool value)
+                 port.WritePin(pin, value ^ invert);
+             }
+
+-            public bool IsConnected { get; set; }
++            public bool IsConnected
++            {
++                get => isConnected;
++                set
++                {
++                    isConnected = value;
++                    port.ResolvePin(pin);
++                }
++            }
++
++            public bool Value
++            {
++                get
++                {
++                    var invert = port.invertedAFPins.Contains(new InvertedAFPin(pin, activeFunction));
++                    return functionStates[activeFunction] ^ invert;
++                }
++            }
+
+             public ulong ActiveFunction
+             {
+@@ -238,11 +288,21 @@ public ulong ActiveFunction
+                 set
+                 {
+                     var val = (int)value;
++                    if(val < 0 || val >= functionStates.Length)
++                    {
++                        this.Log(LogLevel.Error,
++                            "Alternate function number must be between 0 and {0}, but {1} was given instead.",
++                            functionStates.Length - 1, val);
++                        return;
++                    }
+                     activeFunction = val;
++                    port.ResolvePin(pin);
+                 }
+             }
+
+             private int activeFunction;
++            private bool isConnected;
++            private readonly bool[] functionStates;
+
+             private readonly STM32F1GPIOPort port;
+             private readonly int pin;
+@@ -290,4 +350,4 @@ private enum OutputMode
+             AlternateFunctionOpenDrain = 3
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
+index 998b06b4a..e3bcf9691 100644
+--- a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
++++ b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
+@@ -60,6 +60,8 @@ public STM32_GPIOPort(IMachine machine, uint modeResetValue = 0, uint outputSpee
+             mode = new Mode[NumberOfPins];
+             outputSpeed = new OutputSpeed[NumberOfPins];
+             pullUpPullDown = new PullUpPullDown[NumberOfPins];
++            outputData = new bool[NumberOfPins];
++            externalInputs = new bool[NumberOfPins];
+
+             this.modeResetValue = modeResetValue;
+             this.outputSpeedResetValue = outputSpeedResetValue;
+@@ -79,6 +81,8 @@ public STM32_GPIOPort(IMachine machine, uint modeResetValue = 0, uint outputSpee
+         public override void Reset()
+         {
+             base.Reset();
++            System.Array.Clear(outputData, 0, outputData.Length);
++            System.Array.Clear(externalInputs, 0, externalInputs.Length);
+             registers.Reset();
+
+             for(var i = 0; i < NumberOfPins; i++)
+@@ -103,8 +107,13 @@ public void WriteDoubleWord(long offset, uint value)
+
+         public override void OnGPIO(int number, bool value)
+         {
+-            base.OnGPIO(number, value);
+-            Connections[number].Set(value);
++            if(!CheckPinNumber(number))
++            {
++                return;
++            }
++
++            externalInputs[number] = value;
++            ResolvePin(number);
+         }
+
+         public IGPIOReceiver GetLocalReceiver(int pin)
+@@ -127,8 +136,8 @@ private void WriteState(ushort value)
+         {
+             for(var i = 0; i < NumberOfPins; i++)
+             {
+-                var state = ((value & 1u) == 1);
+-                WritePin(i, state);
++                outputData[i] = ((value & 1u) == 1);
++                ResolvePin(i);
+
+                 value >>= 1;
+             }
+@@ -138,6 +147,28 @@ private void ChangeMode(int number, Mode newMode)
+         {
+             mode[number] = newMode;
+             alternateFunctionOutputs[number].IsConnected = newMode == Mode.AlternateFunction;
++            ResolvePin(number);
++        }
++
++        private void ResolvePin(int number)
++        {
++            bool value;
++            switch(mode[number])
++            {
++                case Mode.Input:
++                    value = externalInputs[number];
++                    break;
++                case Mode.Output:
++                    value = outputData[number];
++                    break;
++                case Mode.AlternateFunction:
++                    value = alternateFunctionOutputs[number].Value;
++                    break;
++                default:
++                    value = false;
++                    break;
++            }
++            WritePin(number, value);
+         }
+
+         private DoubleWordRegisterCollection CreateRegisters()
+@@ -183,15 +214,15 @@ private DoubleWordRegisterCollection CreateRegisters()
+                     .WithReservedBits(16, 16)
+                 },
+                 {(long)Registers.OutputData, new DoubleWordRegister(this)
+-                    .WithValueField(0, 16, writeCallback: (_, val) => WriteState((ushort)val), valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(State), name: "ODR")
++                    .WithValueField(0, 16, writeCallback: (_, val) => WriteState((ushort)val), valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(outputData), name: "ODR")
+                     .WithReservedBits(16, 16)
+                 },
+                 {(long)Registers.BitSet, new DoubleWordRegister(this)
+                     .WithValueField(0, 16, FieldMode.Write,
+-                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(State) | val)); },
++                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(outputData) | val)); },
+                         name: "GPIOx_BS")
+                     .WithValueField(16, 16, FieldMode.Write,
+-                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(State) & ~val)); },
++                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(outputData) & ~val)); },
+                         name: "GPIOx_BR")
+                 },
+                 { (long)Registers.ConfigurationLock, new DoubleWordRegister(this)
+@@ -228,7 +259,7 @@ private DoubleWordRegisterCollection CreateRegisters()
+                 },
+                 {(long)Registers.BitReset, new DoubleWordRegister(this)
+                     .WithValueField(0, 16, FieldMode.Write,
+-                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(State) & ~val)); },
++                        writeCallback: (_, val) => { if(val != 0) WriteState((ushort)(BitHelper.GetValueFromBitsArray(outputData) & ~val)); },
+                         name: "GPIOx_BRR")
+                     .WithReservedBits(16, 16)
+                 },
+@@ -239,6 +270,8 @@ private DoubleWordRegisterCollection CreateRegisters()
+         private readonly Mode[] mode;
+         private readonly OutputSpeed[] outputSpeed;
+         private readonly PullUpPullDown[] pullUpPullDown;
++        private readonly bool[] outputData;
++        private readonly bool[] externalInputs;
+         private readonly HashSet<InvertedAFPin> invertedAFPins = new HashSet<InvertedAFPin>();
+
+         private readonly uint modeResetValue;
+@@ -262,19 +295,27 @@ public GPIOAlternateFunction(STM32_GPIOPort port, int pin)
+             {
+                 this.port = port;
+                 this.pin = pin;
++                functionStates = new bool[port.numberOfAFs];
+
+                 Reset();
+             }
+
+             public void Reset()
+             {
++                System.Array.Clear(functionStates, 0, functionStates.Length);
+                 IsConnected = false;
+                 ActiveFunction = 0;
+             }
+
+             public void OnGPIO(int number, bool value)
+             {
+-                if(!CheckAFNumber(number) || !IsConnected || number != activeFunction)
++                if(!CheckAFNumber(number))
++                {
++                    return;
++                }
++
++                functionStates[number] = value;
++                if(!IsConnected || number != activeFunction)
+                 {
+                     // Don't emit any log as it is valid to receive signals from AFs when they are not active.
+                     // All alternate function sources are always connected and always sending signals.
+@@ -287,7 +328,24 @@ public void OnGPIO(int number, bool value)
+                 port.WritePin(pin, value ^ invert);
+             }
+
+-            public bool IsConnected { get; set; }
++            public bool IsConnected
++            {
++                get => isConnected;
++                set
++                {
++                    isConnected = value;
++                    port.ResolvePin(pin);
++                }
++            }
++
++            public bool Value
++            {
++                get
++                {
++                    var invert = port.invertedAFPins.Contains(new InvertedAFPin(pin, activeFunction));
++                    return functionStates[activeFunction] ^ invert;
++                }
++            }
+
+             public ulong ActiveFunction
+             {
+@@ -299,6 +357,7 @@ public ulong ActiveFunction
+                     if(CheckAFNumber(val))
+                     {
+                         activeFunction = val;
++                        port.ResolvePin(pin);
+                     }
+                 }
+             }
+@@ -314,6 +373,8 @@ private bool CheckAFNumber(int number)
+             }
+
+             private int activeFunction;
++            private bool isConnected;
++            private readonly bool[] functionStates;
+
+             private readonly STM32_GPIOPort port;
+             private readonly int pin;
+@@ -374,4 +435,4 @@ private enum Registers
+             BitReset              = 0x28, //GPIOx_BRR     Bit reset register
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/Emulator/Peripherals/Test/PeripheralsTests/STM32_GPIOPortTests.cs b/src/Emulator/Peripherals/Test/PeripheralsTests/STM32_GPIOPortTests.cs
+new file mode 100644
+index 000000000..44c60c321
+--- /dev/null
++++ b/src/Emulator/Peripherals/Test/PeripheralsTests/STM32_GPIOPortTests.cs
+@@ -0,0 +1,110 @@
++//
++// Copyright (c) 2026 ArduPilot
++//
++// This file is licensed under the MIT License.
++// Full license text is available in 'licenses/MIT.txt'.
++//
++
++using Antmicro.Renode.Core;
++using Antmicro.Renode.Peripherals.GPIOPort;
++
++using NUnit.Framework;
++
++namespace Antmicro.Renode.PeripheralsTests
++{
++    [TestFixture]
++    public class STM32_GPIOPortTests
++    {
++        [Test]
++        public void ShouldResolveOutputAndInputModesImmediately()
++        {
++            var gpio = new STM32_GPIOPort(new Machine());
++
++            gpio.WriteDoubleWord(OutputData, 1);
++            Assert.True((gpio.ReadDoubleWord(OutputData) & 1) != 0);
++            Assert.False(gpio.Connections[0].IsSet);
++
++            gpio.OnGPIO(0, true);
++            Assert.True(gpio.Connections[0].IsSet);
++
++            gpio.WriteDoubleWord(Mode, OutputMode);
++            Assert.True(gpio.Connections[0].IsSet);
++            gpio.OnGPIO(0, false);
++            Assert.True(gpio.Connections[0].IsSet);
++
++            gpio.WriteDoubleWord(Mode, InputMode);
++            Assert.False(gpio.Connections[0].IsSet);
++        }
++
++        [Test]
++        public void ShouldRememberInactiveAlternateFunctionLevels()
++        {
++            var gpio = new STM32_GPIOPort(new Machine());
++            var alternateFunction = gpio.GetLocalReceiver(0);
++
++            alternateFunction.OnGPIO(3, true);
++            gpio.WriteDoubleWord(Mode, AlternateFunctionMode);
++            Assert.False(gpio.Connections[0].IsSet);
++
++            gpio.WriteDoubleWord(AlternateFunctionLow, 3);
++            Assert.True(gpio.Connections[0].IsSet);
++
++            alternateFunction.OnGPIO(5, true);
++            alternateFunction.OnGPIO(3, false);
++            Assert.False(gpio.Connections[0].IsSet);
++
++            gpio.WriteDoubleWord(AlternateFunctionLow, 5);
++            Assert.True(gpio.Connections[0].IsSet);
++        }
++
++        [Test]
++        public void F1ShouldResolveRemappedAlternateFunctionImmediately()
++        {
++            var gpio = new STM32F1GPIOPort(new Machine());
++            var alternateFunction = gpio.GetLocalReceiver(0);
++
++            alternateFunction.OnGPIO(5, true);
++            gpio.AlternateFunctionOutputs[0].ActiveFunction = 5;
++            gpio.WriteDoubleWord(F1ConfigurationLow, F1AlternateFunctionOutput);
++            Assert.True(gpio.Connections[0].IsSet);
++
++            gpio.AlternateFunctionOutputs[0].ActiveFunction = 0;
++            Assert.False(gpio.Connections[0].IsSet);
++        }
++
++        [Test]
++        public void F1ShouldSelectEXTISourcePortAtRuntime()
++        {
++            var machine = new Machine();
++            var ports = new STM32F1GPIOPort[7];
++            for(var index = 0; index < ports.Length; index++)
++            {
++                ports[index] = new STM32F1GPIOPort(machine);
++            }
++            var afio = new STM32F1AFIO(machine, ports);
++            ports[0].Connections[0].Connect(afio.GetLocalReceiver(0), 0);
++            ports[1].Connections[0].Connect(afio.GetLocalReceiver(1), 0);
++
++            ports[0].OnGPIO(0, true);
++            Assert.True(afio.Connections[0].IsSet);
++            ports[1].OnGPIO(0, true);
++
++            afio.WriteDoubleWord(F1ExternalInterrupt1, 1);
++            ports[0].OnGPIO(0, false);
++            Assert.True(afio.Connections[0].IsSet);
++            ports[1].OnGPIO(0, false);
++            Assert.False(afio.Connections[0].IsSet);
++        }
++
++        private const long Mode = 0x00;
++        private const long OutputData = 0x14;
++        private const long AlternateFunctionLow = 0x20;
++        private const uint InputMode = 0;
++        private const uint OutputMode = 1;
++        private const uint AlternateFunctionMode = 2;
++
++        private const long F1ConfigurationLow = 0x00;
++        private const long F1ExternalInterrupt1 = 0x08;
++        private const uint F1AlternateFunctionOutput = 0x9;
++    }
++}
