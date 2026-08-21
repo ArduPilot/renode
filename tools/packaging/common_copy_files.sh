@@ -25,7 +25,9 @@ cp -r $BASE/src/Plugins/CoSimulationPlugin/IntegrationLibrary $DIR/plugins
 # Copy required headers into the package and adjust the include
 cp -r $BASE/src/Infrastructure/src/Emulator/Cores/renode/include/{renode_imports,map}.h $DIR/plugins/IntegrationLibrary/src
 $SED_COMMAND s:../../../../Infrastructure/src/Emulator/Cores/renode/include/::g $DIR/plugins/IntegrationLibrary/src/renode_bus.h
-cp -r $BASE/src/Plugins/SystemCPlugin/SystemCModule $DIR/plugins
+# Dereference socket-cpp before replacing it below; Windows cp cannot recreate
+# its source-tree-relative symlink in the package layout.
+cp -rL $BASE/src/Plugins/SystemCPlugin/SystemCModule $DIR/plugins
 # For now, SystemCPlugin uses socket-cpp library from CoSimulationPlugin IntegrationLibrary.
 # ln -f argument is quietly ignored in windows-package environment, so instead of updating remove the link
 # and create it again.
