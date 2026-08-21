@@ -1,0 +1,126 @@
+name: Build portable packages
+
+on:
+  push:
+    branches:
+      - master
+      - pr-arudpilot-am32-perf
+    tags:
+      - ardupilot-*
+  pull_request:
+    branches:
+      - master
+      - pr-arudpilot-am32-perf
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+            platform: linux
+            architecture: x86_64
+            host_architecture: i386
+            runtime_identifier: linux-x64
+            artifact: renode-linux-x86_64
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            architecture: aarch64
+            host_architecture: aarch64
+            runtime_identifier: linux-arm64
+            artifact: renode-linux-aarch64
+          - name: macOS Intel
+            runner: macos-15-intel
+            platform: macos
+            architecture: x86_64
+            host_architecture: i386
+            runtime_identifier: osx-x64
+            artifact: renode-macos-x86_64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            platform: macos
+            architecture: arm64
+            host_architecture: aarch64
+            runtime_identifier: osx-arm64
+            artifact: renode-macos-arm64
+          - name: Windows x86-64
+            runner: windows-2025
+            platform: windows
+            architecture: x86_64
+            host_architecture: i386
+            runtime_identifier: win-x64
+            artifact: renode-windows-x86_64
+
+    steps:
+      - name: Check out Renode
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: Apply ArduPilot performance patches
+        shell: bash
+        run: ./perf_patches/apply.sh
+
+      - name: Build portable package
+        shell: bash
+        run: ./build.sh -t -n --net --host-arch ${{ matrix.host_architecture }}
+
+      - name: Verify package archive
+        shell: bash
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+        run: |
+          case "$TARGET_PLATFORM" in
+            linux)
+              tar -tzf output/packages/*.tar.gz >/dev/null
+              ;;
+            macos)
+              hdiutil verify output/packages/*.dmg
+              ;;
+            windows)
+              tar -tf output/packages/*.zip >/dev/null
+              ;;
+          esac
+
+      - name: Create package metadata
+        shell: bash
+        run: |
+          python tools/packaging/create_ci_metadata.py \
+            --platform "${{ matrix.platform }}" \
+            --architecture "${{ matrix.architecture }}" \
+            --runtime-identifier "${{ matrix.runtime_identifier }}" \
+            --package-directory output/packages \
+            --output "output/packages/${{ matrix.artifact }}.json"
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: output/packages/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

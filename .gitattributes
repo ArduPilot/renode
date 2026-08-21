@@ -1,1 +1,2 @@
 *.cs diff=csharp
+perf_patches/*.patch text eol=lf
