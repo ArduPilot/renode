@@ -14,7 +14,7 @@ firmware workloads under Renode:
 The headline numbers, both with bit-identical simulation results:
 
 - AM32 STM32L431 spin: **~1.9x** wall time (median of cpu-pinned
-  interleaved A/B pairs; clean pairs reach 2.0x) from the six patches
+  interleaved A/B pairs; clean pairs reach 2.0x) from the core six patches
   on this branch built for net8.0, on top of an earlier ~3x from
   harness-side work (below). Built for net10.0 the same patches
   measure **2.2–2.3x** — the newer runtime adds ~35% by itself.
@@ -23,11 +23,11 @@ The headline numbers, both with bit-identical simulation results:
   from 325s to 216s; the time-framework commit here removes the same
   cost at its source.
 
-## The six changes on this branch
+## The shared patch stack
 
 All the code changes live in the `src/Infrastructure` submodule, but
 this branch deliberately keeps the recorded submodule commit at STOCK
-renode 1.16.1 and carries the changes as `perf_patches/000?-*.patch`
+renode 1.16.1 and carries the changes as a numbered `perf_patches/` series
 instead: `.gitmodules` keeps pointing at the public
 renode-infrastructure repository, so the branch is fully
 self-contained — cloneable (including as a future submodule of other
@@ -101,6 +101,23 @@ exact commit stock renode 1.16.1 records.
    pure arithmetic; limit handlers fire after the loop (from
    `toNotify`), so the list cannot change shape while the span is
    live. The copying loop remains for the mono build.
+7. **STM32 runtime pin routing.** GPIO output latches, external inputs,
+   alternate-function selection and F1 AFIO routing are resolved at runtime.
+   This is required by ArduPilot's generated board descriptions and also gives
+   AM32 an accurate pad-level model for capture inputs.
+8. **USB/IP device state.** USB/IP clients receive the device state needed to
+   enumerate Renode USB devices through a host VHCI controller. This is used by
+   ArduPilot's emulated STM32 USB device and is inert when no USB/IP server is
+   configured.
+9. **AM32 polled-peripheral fast paths.** A raw clock-tick accessor and compact
+   STM32 GPIO configuration accessors avoid generic register reconstruction in
+   AM32's high-rate timer and motor-model polling. IDR reads sample externally
+   driven pads in alternate-function input modes, which is required for timer
+   capture correctness. The AM32 peripherals discover these APIs at runtime
+   and retain their generic fallback for stock Renode.
+10. **Non-TrustZone NVIC fast path.** Cortex-M systems without TrustZone skip
+    the SystemBus current-CPU lookup on NVIC and SysTick accesses. TrustZone
+    systems retain the original secure-state lookup.
 
 ## Where the time actually goes (both projects agree)
 
@@ -303,11 +320,13 @@ Infrastructure working tree (or a branch checked out there for
 development; see the measurement-discipline section). Re-run
 `apply.sh` if the submodule ever gets reset.
 
-Validated against both harnesses at these commits: the full AM32
-scripted suite passes at its recorded per-target figures
-(`run_renode_tests.py --renode <this>/renode`), an ArduPilot KakuteF4
-ArduCopter ELF boots to a running ChibiOS kernel, and the simulation
-markers are bit-identical to stock 1.16.1 throughout.
+Validated against both harnesses: the AM32 scripted motor test passes with the
+recorded RPM and BEMF markers, and the ArduPilot CubeOrangePlus test boots,
+receives a MAVLink heartbeat and downloads all parameters over FTP. On the
+shared Linux host, three CPU-pinned AM32 L431 samples gave a 1.352x median
+steady-state rate. Isolated CubeOrangePlus samples gave 0.528--0.566x versus
+0.526--0.539x before patches 9 and 10; host variability dominates that small
+difference, but there is no measured ArduPilot regression.
 
 Cumulative on the AM32 L431 spin probe (cpu-pinned interleaved A/B
 pairs on a loaded host, vs the stock 1.16.1 net8.0 portable): built

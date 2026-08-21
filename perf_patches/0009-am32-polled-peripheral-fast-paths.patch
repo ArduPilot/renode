@@ -1,0 +1,184 @@
+diff --git a/src/Emulator/Main/Time/BaseClockSource.cs b/src/Emulator/Main/Time/BaseClockSource.cs
+--- a/src/Emulator/Main/Time/BaseClockSource.cs
++++ b/src/Emulator/Main/Time/BaseClockSource.cs
+@@ -419,6 +419,13 @@ public virtual TimeInterval CurrentValue
+             }
+         }
+ 
++        // Avoid constructing a TimeInterval in very hot polled-counter paths.
++        // totalElapsed already includes the slice not yet applied to entries.
++        public ulong GetCurrentValueWithPendingTicks()
++        {
++            return totalElapsed.Ticks;
++        }
++
+         public bool HasEntries
+         {
+             get
+diff --git a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
+--- a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
++++ b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
+@@ -105,6 +105,18 @@ public void WriteDoubleWord(long offset, uint value)
+             registers.Write(offset, value);
+         }
+ 
++        // Return the state which software would observe in MODER, ODR and
++        // AFR for one pin without constructing those whole registers. This
++        // is useful to peripherals which continuously consume a small set
++        // of pins (for example, a motor/plant model). Bits 1:0 are MODER,
++        // bit 2 is ODR, and bits 7:4 are the selected alternate function.
++        public uint GetPinConfiguration(int pin)
++        {
++            return (uint)mode[pin]
++                | (outputData[pin] ? 1u << 2 : 0u)
++                | (uint)alternateFunctionOutputs[pin].ActiveFunction << 4;
++        }
++
+         public override void OnGPIO(int number, bool value)
+         {
+             if(!CheckPinNumber(number))
+diff --git a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
+--- a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
++++ b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32_GPIOPort.cs
+@@ -62,6 +62,7 @@ public STM32_GPIOPort(IMachine machine, uint modeResetValue = 0, uint outputSpee
+             pullUpPullDown = new PullUpPullDown[NumberOfPins];
+             outputData = new bool[NumberOfPins];
+             externalInputs = new bool[NumberOfPins];
++            externalInputActive = new bool[NumberOfPins];
+ 
+             this.modeResetValue = modeResetValue;
+             this.outputSpeedResetValue = outputSpeedResetValue;
+@@ -113,6 +114,7 @@ public override void OnGPIO(int number, bool value)
+             }
+ 
+             externalInputs[number] = value;
++            externalInputActive[number] = true;
+             ResolvePin(number);
+         }
+ 
+@@ -171,6 +173,26 @@ private void ResolvePin(int number)
+             WritePin(number, value);
+         }
+ 
++        private uint GetInputData()
++        {
++            uint value = 0;
++            for(var i = 0; i < NumberOfPins; i++)
++            {
++                // IDR samples the pad, including while the pin is in an
++                // alternate-function input mode. State is the resolved
++                // output value and cannot represent an externally driven
++                // AF input (for example a timer capture pin).
++                var pinValue = externalInputActive[i] && mode[i] != Mode.Output
++                    ? externalInputs[i]
++                    : State[i];
++                if(pinValue)
++                {
++                    value |= 1u << i;
++                }
++            }
++            return value;
++        }
++
+         private DoubleWordRegisterCollection CreateRegisters()
+         {
+             var registersMap = new Dictionary<long, DoubleWordRegister>
+@@ -210,7 +232,7 @@ private DoubleWordRegisterCollection CreateRegisters()
+                         writeCallback: (idx, _, val) => { pullUpPullDown[idx] = val; })
+                 },
+                 {(long)Registers.InputData, new DoubleWordRegister(this)
+-                    .WithValueField(0, 16, FieldMode.Read, valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(State), name: "IDR")
++                    .WithValueField(0, 16, FieldMode.Read, valueProviderCallback: _ => GetInputData(), name: "IDR")
+                     .WithReservedBits(16, 16)
+                 },
+                 {(long)Registers.OutputData, new DoubleWordRegister(this)
+@@ -272,6 +294,7 @@ private DoubleWordRegisterCollection CreateRegisters()
+         private readonly PullUpPullDown[] pullUpPullDown;
+         private readonly bool[] outputData;
+         private readonly bool[] externalInputs;
++        private readonly bool[] externalInputActive;
+         private readonly HashSet<InvertedAFPin> invertedAFPins = new HashSet<InvertedAFPin>();
+ 
+         private readonly uint modeResetValue;
+diff --git a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs
+--- a/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs
++++ b/src/Emulator/Peripherals/Peripherals/GPIOPort/STM32F1GPIOPort.cs
+@@ -54,6 +54,7 @@ public STM32F1GPIOPort(IMachine machine, List<List<int>> invertedAFPins = null)
+             pinsOutputMode = new OutputMode[NumberOfPorts];
+             outputData = new bool[NumberOfPorts];
+             externalInputs = new bool[NumberOfPorts];
++            externalInputActive = new bool[NumberOfPorts];
+             AlternateFunctionOutputs = new GPIOAlternateFunction[NumberOfPorts];
+             for(var i = 0; i < NumberOfPorts; i++)
+             {
+@@ -82,7 +83,7 @@ public STM32F1GPIOPort(IMachine machine, List<List<int>> invertedAFPins = null)
+                 {(long)Registers.ConfigurationHigh, configurationHighRegister},
+                 {(long)Registers.InputData, new DoubleWordRegister(this)
+                     // upper 16 bits are reserved
+-                    .WithValueField(0, 16, FieldMode.Read, name: "IDR", valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(State))
++                    .WithValueField(0, 16, FieldMode.Read, name: "IDR", valueProviderCallback: _ => GetInputData())
+                 },
+                 {(long)Registers.OutputData, new DoubleWordRegister(this)
+                     // upper 16 bits are reserved
+@@ -112,6 +113,7 @@ public override void OnGPIO(int number, bool value)
+             }
+ 
+             externalInputs[number] = value;
++            externalInputActive[number] = true;
+             ResolvePin(number);
+         }
+ 
+@@ -148,6 +150,20 @@ public void WriteDoubleWord(long offset, uint value)
+             registers.Write(offset, value);
+         }
+ 
++        // Compact pin state for high-rate users such as the AM32 motor
++        // bridge. Bits 0..3 are the native F1 configuration nibble and bit 4
++        // is the output latch. This avoids rebuilding three register values
++        // through the generic register framework on every physics tick.
++        public uint GetPinConfiguration(int pin)
++        {
++            if(!CheckPinNumber(pin))
++            {
++                return 0;
++            }
++            return (uint)pins[pin] | ((uint)pinsOutputMode[pin] << 2)
++                | (outputData[pin] ? 1u << 4 : 0u);
++        }
++
+         // NOTE: This array holds connections from AFs to specific GPIO pins.
+         // From the PoV of this peripheral they're inputs,
+         // however they represent the output pins of this peripheral hence the name.
+@@ -201,6 +217,24 @@ private void ResolvePin(int number)
+             WritePin(number, value);
+         }
+ 
++        private uint GetInputData()
++        {
++            uint value = 0;
++            for(var i = 0; i < NumberOfPorts; i++)
++            {
++                // Input configurations, including alternate-function
++                // capture inputs, sample the externally driven pad.
++                var pinValue = externalInputActive[i] && pins[i] == PinMode.Input
++                    ? externalInputs[i]
++                    : State[i];
++                if(pinValue)
++                {
++                    value |= 1u << i;
++                }
++            }
++            return value;
++        }
++
+         private void SetBitsFromMask(uint mask, bool state)
+         {
+             foreach(var bit in BitHelper.GetSetBits(mask))
+@@ -217,6 +251,7 @@ private void SetBitsFromMask(uint mask, bool state)
+         private readonly OutputMode[] pinsOutputMode;
+         private readonly bool[] outputData;
+         private readonly bool[] externalInputs;
++        private readonly bool[] externalInputActive;
+ 
+         private const int NumberOfPorts = 16;
+         private const int NumberOfTimers = 18;

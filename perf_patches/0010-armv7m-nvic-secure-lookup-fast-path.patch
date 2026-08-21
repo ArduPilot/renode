@@ -1,0 +1,55 @@
+diff --git a/src/Emulator/Cores/Arm-M/NVIC.cs b/src/Emulator/Cores/Arm-M/NVIC.cs
+index 750965c..cd2f101 100644
+--- a/src/Emulator/Cores/Arm-M/NVIC.cs
++++ b/src/Emulator/Cores/Arm-M/NVIC.cs
+@@ -405,7 +405,11 @@ public void WriteDoubleWord(long offset, uint value, bool isSecure)
+ 
+         public void WriteDoubleWord(long offset, uint value)
+         {
+-            WriteDoubleWord(offset, value, IsCurrentCPUInSecureState(out var _));
++            // The overwhelming majority of Cortex-M systems, including all
++            // ARMv7-M cores, have no TrustZone state to resolve. Avoid a
++            // SystemBus current-CPU lookup on every NVIC MMIO access there.
++            WriteDoubleWord(offset, value,
++                cpu.TrustZoneEnabled && IsCurrentCPUInSecureState(out var _));
+         }
+ 
+         [ConnectionRegion("NonSecure")]
+@@ -516,7 +520,8 @@ public uint ReadDoubleWord(long offset, bool isSecure)
+ 
+         public uint ReadDoubleWord(long offset)
+         {
+-            return ReadDoubleWord(offset, IsCurrentCPUInSecureState(out var _));
++            return ReadDoubleWord(offset,
++                cpu.TrustZoneEnabled && IsCurrentCPUInSecureState(out var _));
+         }
+ 
+         public string OffsetToString(long offset) => mapper.ToString(offset);
+@@ -625,19 +630,23 @@ public byte BASEPRI_NS
+ 
+         public ulong Frequency
+         {
+-            get => systick.Get(IsCurrentCPUInSecureState(out var _)).Frequency;
++            get => systick.Get(cpu.TrustZoneEnabled
++                && IsCurrentCPUInSecureState(out var _)).Frequency;
+             set
+             {
+-                systick.Get(IsCurrentCPUInSecureState(out var _)).Frequency = value;
++                systick.Get(cpu.TrustZoneEnabled
++                    && IsCurrentCPUInSecureState(out var _)).Frequency = value;
+             }
+         }
+ 
+         public ulong Divider
+         {
+-            get => systick.Get(IsCurrentCPUInSecureState(out var _)).Divider;
++            get => systick.Get(cpu.TrustZoneEnabled
++                && IsCurrentCPUInSecureState(out var _)).Divider;
+             set
+             {
+-                systick.Get(IsCurrentCPUInSecureState(out var _)).Divider = value;
++                systick.Get(cpu.TrustZoneEnabled
++                    && IsCurrentCPUInSecureState(out var _)).Divider = value;
+             }
+         }
+ 

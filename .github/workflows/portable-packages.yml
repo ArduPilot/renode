@@ -81,7 +81,7 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Apply ArduPilot performance patches
+      - name: Apply shared ArduPilot and AM32 patches
         shell: bash
         run: ./perf_patches/apply.sh
 
