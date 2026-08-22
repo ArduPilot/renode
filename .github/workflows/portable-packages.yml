@@ -102,7 +102,7 @@ jobs:
               hdiutil verify output/packages/*.dmg
               ;;
             windows)
-              tar -tf output/packages/*.zip >/dev/null
+              /c/Windows/SysWOW64/tar.exe -tf output/packages/*.zip >/dev/null
               ;;
           esac
 
