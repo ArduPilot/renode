@@ -118,6 +118,11 @@ exact commit stock renode 1.16.1 records.
 10. **Non-TrustZone NVIC fast path.** Cortex-M systems without TrustZone skip
     the SystemBus current-CPU lookup on NVIC and SysTick accesses. TrustZone
     systems retain the original secure-state lookup.
+11. **USB/IP ordered IN transfers and unlink.** IN URBs on an endpoint are
+    served one at a time in submission order; concurrent reads split and
+    reordered a CDC ACM device's data between the host's queued URBs. CMD_UNLINK
+    is answered with RET_UNLINK and the unlinked URB is never answered, so
+    closing a busy port no longer leaves the host blocked until Renode exits.
 
 ## Where the time actually goes (both projects agree)
 
