@@ -25,21 +25,21 @@ The headline numbers, both with bit-identical simulation results:
 
 ## The shared patch stack
 
-All the code changes live in the `src/Infrastructure` submodule, but
-this branch deliberately keeps the recorded submodule commit at STOCK
-renode 1.16.1 and carries the changes as a numbered `perf_patches/` series
-instead: `.gitmodules` keeps pointing at the public
-renode-infrastructure repository, so the branch is fully
-self-contained — cloneable (including as a future submodule of other
-projects) without a forked Infrastructure repository. After
+All the code changes live in the `src/Infrastructure` submodule or its
+nested tlib submodule, but this branch deliberately keeps both recorded
+submodule commits at stock renode 1.16.1 and carries the changes as
+numbered `perf_patches/` series instead: `.gitmodules` keeps pointing at
+the public repositories, so the branch is fully self-contained —
+cloneable (including as a future submodule of other projects) without
+forked Infrastructure or tlib repositories. After
 `git submodule update --init --recursive`, apply the patches to the
 submodule working tree with:
 
     ./perf_patches/apply.sh
 
-(idempotent; refuses to run on a wrong Infrastructure base). The
-patches apply in order onto Infrastructure commit `add012af0`, the
-exact commit stock renode 1.16.1 records.
+(idempotent; refuses to run on a wrong submodule base). The patches
+apply in order onto Infrastructure commit `add012af0` and tlib commit
+`d50c868f`, the exact commits stock renode 1.16.1 records.
 
 1. **Time framework: dictionary handler lookup + integer fraction
    math.** `BaseClockSource` looked up clock entries *by delegate* with
@@ -123,6 +123,10 @@ exact commit stock renode 1.16.1 records.
     reordered a CDC ACM device's data between the host's queued URBs. CMD_UNLINK
     is answered with RET_UNLINK and the unlinked URB is never answered, so
     closing a busy port no longer leaves the host blocked until Renode exits.
+12. **Cortex-M exception stacking faults.** Non-TrustZone ARMv7-M targets keep
+    the original exception-return state when MPU protection faults while an
+    exception frame is being stacked. The incomplete frame is not popped, and
+    the original exception is re-selected against the derived MemManage fault.
 
 ## Where the time actually goes (both projects agree)
 
@@ -306,7 +310,7 @@ one. Details and fixes: ArduPilot `Tools/renode/README.md` and AM32
 
 ```
 git submodule update --init --recursive
-./perf_patches/apply.sh    # patch src/Infrastructure (idempotent)
+./perf_patches/apply.sh    # patch Infrastructure and tlib (idempotent)
 ./build.sh --net           # needs the dotnet SDK on PATH
 ./renode --disable-gui --console -e 'include @your.resc'
 ```
