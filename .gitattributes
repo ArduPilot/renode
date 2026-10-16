@@ -1,2 +1,3 @@
 *.cs diff=csharp
-perf_patches/*.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof
+perf_patches/apply.sh text eol=lf
+perf_patches/**/*.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof
